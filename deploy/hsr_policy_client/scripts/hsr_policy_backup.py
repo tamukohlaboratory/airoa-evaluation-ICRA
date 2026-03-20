@@ -440,212 +440,6 @@ class SyntheticReplayEnv:
     def sleep(self):
         self.rate.sleep()
 
-class LeRobotReplayEnv:
-    """Replay environment that streams observations/actions from a LeRobotDataset.
-
-    Intended for test_mode only: it does NOT command a real robot.
-    It replays exactly one episode (by default the first in the provided episode list)
-    and reports episode termination when `next.done` becomes True.
-    """
-
-    def __init__(
-        self,
-        *,
-        repo_id: str,
-        episodes: list[int],
-        update_freq: int = 100,
-        episode_id: Optional[int] = None,
-        video_backend: str = "pyav",
-    ):
-        self.update_freq = int(update_freq)
-        self.rate = rospy.Rate(self.update_freq)
-
-        # Lazy import so that real-robot deployment doesn't require lerobot deps.
-        try:
-            from lerobot.datasets.lerobot_dataset import LeRobotDataset
-            from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-        except Exception:
-            from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-            from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
-
-        if episode_id is not None:
-            episodes = [int(episode_id)]
-        if not episodes:
-            episodes = None
-            # raise ValueError("LeRobotReplayEnv: episodes must be a non-empty list.")
-
-        self.repo_id = str(repo_id)
-        if episodes is not None:
-            self.episodes = [int(x) for x in episodes]
-            rospy.loginfo(len(self.episodes))
-        else:
-            self.episodes = None
-            rospy.loginfo("全データ使う")
-        # self.episode_id = int(self.episodes[0])
-
-        self.dataset = LeRobotDataset(self.repo_id, video_backend=str(video_backend), episodes=self.episodes)
-
-        # Per-step cursor within this dataset (which is already filtered to one episode).
-        self._i = 0
-        self._finished = False
-
-        # For compatibility with main loop / policy.
-        self.instruction = str(rospy.get_param("~instruction", ""))
-        self.gripper_state = 0
-        self.control_mode = "auto"
-        self.joint_state: Optional[np.ndarray] = None
-        self._last_action: Optional[np.ndarray] = None
-        self._last_sample: Optional[dict[str, Any]] = None
-
-        self.joint_state_names: list[str] = [
-            "arm_lift_joint",
-            "arm_flex_joint",
-            "arm_roll_joint",
-            "wrist_flex_joint",
-            "wrist_roll_joint",
-            "hand_motor_joint",
-            "head_pan_joint",
-            "head_tilt_joint",
-        ]
-        self.base_action_names: list[str] = ["base_x", "base_y", "base_theta"]
-
-        rospy.Service("/hsr_policy_client/update_instruction", StringTrigger, self.update_instruction_srv)
-        # rospy.loginfo(
-        #     "Test mode enabled. Replaying LeRobotDataset repo=%s episode=%d (update_freq=%dHz)",
-        #     self.repo_id,
-        #     self.episode_id,
-        #     self.update_freq,
-        # )
-
-    def update_instruction_srv(self, req: StringTrigger):
-        # Allow overriding instruction during replay (useful for quick A/B).
-        self.instruction = req.message
-        rospy.loginfo("Instruction updated: %s", self.instruction)
-        return StringTriggerResponse(success=True)
-
-    def is_finished(self) -> bool:
-        return bool(self._finished)
-
-    def reset_observation(self, *, reset_joint_state: bool = True):
-        _ = reset_joint_state
-        self._i = 0
-        self._finished = False
-        self._last_sample = None
-        return
-
-    def _get_task_text(self, sample: dict[str, Any]) -> str:
-        # Prefer explicit task string if available.
-        task = sample.get("task", None)
-        if isinstance(task, str) and len(task) > 0:
-            return task
-
-        # Fall back to dataset task table (if present).
-        task_index = sample.get("task_index", None)
-        if task_index is not None and hasattr(self.dataset, "tasks"):
-            try:
-                tasks = getattr(self.dataset, "tasks")
-                if isinstance(tasks, (list, tuple)) and 0 <= int(task_index) < len(tasks):
-                    t = tasks[int(task_index)]
-                    if isinstance(t, str) and len(t) > 0:
-                        return t
-            except Exception:
-                pass
-
-        # Otherwise keep whatever is set by ROS param/service, or a safe default.
-        return self.instruction or "Grasp the apple."
-
-    def _make_gt_action(self, sample: dict[str, Any]) -> Optional[np.ndarray]:
-        # Expected keys:
-        # action.arm (5), action.gripper (1), action.head (2), action.base (3)
-        try:
-            # arm = np.asarray(sample["action.arm"], dtype=np.float32).reshape(-1)
-            # gripper = np.asarray(sample["action.gripper"], dtype=np.float32).reshape(-1)
-            # head = np.asarray(sample["action.head"], dtype=np.float32).reshape(-1)
-            # base = np.asarray(sample["action.base"], dtype=np.float32).reshape(-1)
-            # gt = np.concatenate([arm, gripper, head, base], axis=0).astype(np.float32)
-            # return gt.reshape(-1)
-            rospy.loginfo(sample["action.relative"])
-            arm = np.asarray(sample["action.relative"][:5], dtype=np.float32).reshape(-1)
-            
-            gripper = np.asarray(sample["action.relative"][5:6], dtype=np.float32).reshape(-1)
-            head = np.asarray(sample["action.relative"][6:8], dtype=np.float32).reshape(-1)
-            base = np.asarray(sample["action.relative"][8:11], dtype=np.float32).reshape(-1)
-            gt = np.concatenate([arm, gripper, head, base], axis=0).astype(np.float32)
-            return gt.reshape(-1)
-        except Exception as e:
-            rospy.loginfo("Warning: sample is missing expected action keys or has invalid formats. GT action will be unavailable for this step.") 
-            rospy.loginfo(str(e))  
-            
-            return None
-
-    def get_observations(self):
-        if self._finished:
-            rospy.loginfo("Episode finished. No more observations.")
-            return None
-        if self._i >= len(self.dataset):
-            self._finished = True
-            rospy.loginfo("Episode finished. No more observations.22")
-            return None
-
-        sample = self.dataset[self._i]
-        # Some dataset implementations return dataclasses/pytrees; normalize to dict.
-        if not isinstance(sample, dict):
-            try:
-                sample = dict(sample)
-            except Exception as e:
-                rospy.loginfo("Warning: sample is not a dict and cannot be converted to dict. GT action will be unavailable for this step.")
-                rospy.loginfo(f"{e}: sample is not a dict and cannot be converted to dict. Wrapping in '_raw' key.")
-                sample = {"_raw": sample}
-
-        self._last_sample = sample
-        rospy.loginfo(f"Sample {sample}")
-
-        # Required for OpenpiPolicy.act:
-        head_rgb = np.asarray(sample.get("observation.image.head"), dtype=np.uint8)
-        hand_rgb = np.asarray(sample.get("observation.image.hand"), dtype=np.uint8)
-        joint_state = np.asarray(sample.get("observation.state"), dtype=np.float32).reshape(-1)
-
-        self.joint_state = joint_state
-
-        # done = bool(sample.get("next.done", False))
-        # if done:
-        #     self._finished = True
-
-        done = bool(sample.get("next.done", False))
-
-        obs: dict[str, Any] = {
-            "head_rgb": head_rgb,
-            "hand_rgb": hand_rgb,
-            "joint_state": joint_state,
-            "instruction": self._get_task_text(sample),
-            "gripper_state": int(sample.get("observation.gripper", 0)) if sample.get("observation.gripper") is not None else 0,
-            "control_mode": "auto",
-            "done": done,
-        }
-
-        # rospy.loginfo(f"Observation {obs}")
-        # Helpful metadata for debugging/plotting.
-        for k in ["episode_index", "frame_index", "index", "timestamp", "task_index"]:
-            if k in sample:
-                obs[k] = sample[k]
-
-        gt_action = self._make_gt_action(sample)
-        if gt_action is not None:
-            obs["gt_action"] = gt_action
-
-        self._i += 1
-        # episode終端では止めない。datasetを読み切ったら止める
-        if self._i >= len(self.dataset):
-            self._finished = True
-        return obs
-
-    def execute_actions(self, action: np.ndarray) -> bool:
-        # Do not command hardware. Just store.
-        self._last_action = np.asarray(action, dtype=np.float32).reshape(-1)
-        return True
-
-    def sleep(self):
-        self.rate.sleep()
 
 class HSREnv:
     """
@@ -802,8 +596,8 @@ class HSREnv:
             True if action execution is allowed and sent, otherwise False.
         """
         # Execute only when control_mode is set to "auto".
-        # if self.control_mode != "auto":
-        #     return False  # Return False when execution is not allowed.
+        if self.control_mode != "auto":
+            return False  # Return False when execution is not allowed.
 
         # Arm control.
         arm_traj = JointTrajectory()
@@ -1004,10 +798,9 @@ class OpenpiPolicy:
         if len(self.action_queue) > 0:
             action = self.action_queue.popleft()
             # Convert delta-style arm/head outputs back to absolute values.
-            return action
-            # return action + np.concatenate(
-            #     [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
-            # )  # Gripper/base dimensions are not delta-form, so add zeros there.
+            return action + np.concatenate(
+                [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
+            )  # Gripper/base dimensions are not delta-form, so add zeros there.
         # Build input dictionary for policy inference.
         policy_input = {
             "head_rgb": obs["head_rgb"],
@@ -1044,11 +837,9 @@ class OpenpiPolicy:
         action = action_chunk[0]  # Return only the first action now; queue the rest.
 
         # Convert delta-style arm/head outputs back to absolute values.
-        return action
-        # 一旦推論されるactionデルタだけでやる
-        # return action + np.concatenate(
-        #     [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
-        # )  # Gripper/base dimensions are not delta-form, so add zeros there.
+        return action + np.concatenate(
+            [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
+        )  # Gripper/base dimensions are not delta-form, so add zeros there.
 
     def get_last_original_action_chunk(self) -> Optional[np.ndarray]:
         return self._last_original_action_chunk
@@ -1062,7 +853,7 @@ class ExecTraceRecorder:
         config_name: str,
         joint_dim_names: Optional[list[str]] = None,
         base_action_names: Optional[list[str]] = None,
-        base_dir: str = "/root/datasets/rosbags",
+        base_dir: str = "/home/policy/deploy_record",
     ):
         self.enabled = bool(enabled)
         self.config_name = str(config_name)
@@ -1073,45 +864,16 @@ class ExecTraceRecorder:
         self._t: list[float] = []
         self._joint_state: list[np.ndarray] = []
         self._action: list[np.ndarray] = []
-        self._gt_action: list[np.ndarray] = []
-        self._timestamp: list[float] = []
         self._t_action_original: list[float] = []
         self._action_original_delta: list[np.ndarray] = []
         self._t_chunk_start: list[float] = []
-        self._task: str = ""
-        self._episode_no: Optional[int] = None
 
-    def add(
-        self,
-        *,
-        stamp_s: float,
-        joint_state: np.ndarray,
-        action: np.ndarray,
-        gt_action: Optional[np.ndarray] = None,
-        timestamp: Optional[float] = None,
-        task: Optional[str] = None,
-        episode_no: Optional[int] = None,
-    ) -> None:
-        rospy.loginfo(f"Adding trace step: stamp_s={stamp_s}, task={task}, episode_no={episode_no}")
+    def add(self, *, stamp_s: float, joint_state: np.ndarray, action: np.ndarray) -> None:
         if not self.enabled:
             return
-        if task is not None and self._task == "":
-            self._task = str(task)
-        if episode_no is not None and self._episode_no is None:
-            self._episode_no = int(episode_no)
         self._t.append(float(stamp_s))
         self._joint_state.append(np.asarray(joint_state, dtype=np.float32).reshape(-1))
         self._action.append(np.asarray(action, dtype=np.float32).reshape(-1))
-        if gt_action is not None:
-            self._gt_action.append(np.asarray(gt_action, dtype=np.float32).reshape(-1))
-        else:
-            # Keep alignment by appending NaNs when gt_action is missing.
-            rospy.loginfo("gt_action is missing for this step. Appending NaNs to keep alignment.")
-            self._gt_action.append(np.full_like(self._action[-1], np.nan, dtype=np.float32))
-        if timestamp is not None:
-            self._timestamp.append(float(timestamp))
-        else:
-            self._timestamp.append(np.nan)
 
     def add_chunk_start(self, *, stamp_s: float) -> None:
         if not self.enabled:
@@ -1135,7 +897,6 @@ class ExecTraceRecorder:
 
     def _output_dir(self) -> str:
         safe_name = self.config_name.replace("/", "_").replace(os.sep, "_").strip()
-        safe_name = "relocate_all_ep300_epoch100_convert_gripper_False_fix_select_episodes"# + safe_name  # Prefix to ensure non-empty and identifiable name.
         if safe_name == "":
             safe_name = "unknown_config"
         return os.path.join(self.base_dir, safe_name)
@@ -1185,8 +946,6 @@ class ExecTraceRecorder:
             "t": np.asarray(self._t, dtype=np.float64),
             "joint_state": np.stack(self._joint_state, axis=0),
             "action": np.stack(self._action, axis=0),
-            "gt_action": np.stack(self._gt_action, axis=0),
-            "timestamp": np.asarray(self._timestamp, dtype=np.float64),
             "joint_dim_names": np.asarray(self.joint_dim_names, dtype=str),
             "base_action_names": np.asarray(self.base_action_names, dtype=str),
         }
@@ -1211,14 +970,6 @@ class ExecTraceRecorder:
         t = np.asarray(self._t, dtype=np.float64)
         joint_state = np.stack(self._joint_state, axis=0)
         action = np.stack(self._action, axis=0)
-        gt_action = np.stack(self._gt_action, axis=0) if len(self._gt_action) == len(self._t) else None
-        timestamp = np.asarray(self._timestamp, dtype=np.float64) if len(self._timestamp) == len(self._t) else None
-        use_timestamp = False
-        if timestamp is not None:
-            # Use dataset timestamp if it looks valid (not all NaNs).
-            use_timestamp = not np.all(np.isnan(timestamp))
-        x = timestamp if use_timestamp else t
-        x_label = "timestamp" if use_timestamp else "time [s]"
         t_chunk_start = np.asarray(self._t_chunk_start, dtype=np.float64) if len(self._t_chunk_start) > 0 else None
         t_action_original = (
             np.asarray(self._t_action_original, dtype=np.float64) if len(self._t_action_original) > 0 else None
@@ -1245,17 +996,13 @@ class ExecTraceRecorder:
             ax = axes[i]
             has_joint = i < n_joint
             has_action = i < n_action
-            has_action_original = (not use_timestamp) and action_original_delta is not None and i < n_action_original
-            has_gt_action = gt_action is not None and i < int(gt_action.shape[1])
+            has_action_original = action_original_delta is not None and i < n_action_original
             dim_name = self._dim_name(i)
 
-            # TODO:一旦
-            # if has_joint:
-            #     ax.plot(x, joint_state[:, i], label=f"{dim_name} (input_joint)")
+            if has_joint:
+                ax.plot(t, joint_state[:, i], label=f"{dim_name} (joint)")
             if has_action:
-                ax.plot(x, action[:, i], label=f"{dim_name} (pred)")
-            if has_gt_action:
-                ax.plot(x, gt_action[:, i], label=f"{dim_name} (gt)")
+                ax.plot(t, action[:, i], label=f"{dim_name} (action)")
             if has_action_original and t_action_original is not None:
                 # Convert delta->command using joint_state sampled at the closest previous time.
                 idx = np.searchsorted(t, t_action_original, side="right") - 1
@@ -1278,18 +1025,11 @@ class ExecTraceRecorder:
             ax.set_ylabel(dim_name)
             ax.grid(True, alpha=0.3)
             if i == 0:
-                task = (self._task or "").strip()
-                if len(task) > 80:
-                    task = task[:80] + "..."
-                ep = self._episode_no
-                title = task
-                if ep is not None:
-                    title = f"{task} | episode {ep}"
-                ax.set_title(title if title != "" else "joint/action")
+                ax.set_title("joint/action (same index overlaid when available)")
             if has_joint or has_action:
                 ax.legend(loc="upper right", fontsize=8)
 
-        axes[-1].set_xlabel(x_label)
+        axes[-1].set_xlabel("time [s]")
 
         fig.tight_layout()
         fig.savefig(plot_path, dpi=150, format="png")
@@ -1358,36 +1098,9 @@ def main():
     rospy.loginfo("exec_trace_group_name: %s", trace_group_name)
 
     if test_mode:
-        rospy.loginfo("Test mode enabled: using replay or synthetic env instead of real robot.")
-        # LeRobot replay (preferred) or synthetic random data.
-        lerobot_repo_id = str(rospy.get_param("~lerobot_repo_id", ""))
-        # lerobot_episodes = [0, 1, 696, 697, 700, 701, 705, 715, 3862, 3863, 3864, 3870, 3871, 3874, 3878, 3879, 3886, 3894, 3937, 3979, 4053, 9443, 9444, 9445, 9446, 9447, 9448, 9450, 9451, 9458, 9459, 9461, 9487, 9493, 9507, 9520, 13913, 13914, 13915, 13918, 13919, 13921, 21486, 21487, 21488, 22492, 22493]
-        # lerobot_episodes = [2536226, 2536013, 2535738, 2536152, 2536393, 2536365, 2536315, 2535724, 2536341, 2535877, 2535988, 2536297, 2536272, 2535961, 2536033, 2536125, 2536049, 2535629, 2535786, 2535759, 2535554, 2535918, 2535497, 2536202, 2536164, 2535763, 2535750, 2535480, 2535563, 2536335, 2536254, 2535551, 2535558, 2535511, 2535906, 2536123, 2535775, 2535841, 2536296, 2536096, 2535739, 2535646, 2536352, 2536184, 2536188, 2536079, 2535783, 2536440, 2536473, 2535997, 2535778, 2535649, 2535650, 2536354, 2536087, 2536012, 2536080, 2536068, 2536133, 2536458, 2535570, 2536376, 2536350, 2536340, 2535652, 2535586, 2536060, 2536454, 2535995, 2535661, 2535859, 2535780, 2536210, 2536106, 2535707, 2535764, 2535903, 2536124, 2535624, 2536100, 2536222, 2535566, 2536346, 2536212, 2535499, 2535647, 2536515, 2535840, 2535745, 2536064, 2536150, 2536146, 2535808, 2536058, 2535581, 2535743, 2536038, 2535482, 2536046, 2535882, 2534305, 2533864, 2534326, 2533614, 2534711, 2534907, 2534026, 2534391, 2534775, 2533898, 2534395, 2533775, 2534577, 2534094, 2534592, 2534869, 2534559, 2533926, 2533855, 2534194, 2534878, 2533873, 2534458, 2534800, 2534436, 2534911, 2534553, 2534129, 2534378, 2533647, 2533777, 2534187, 2534115, 2533991, 2533706, 2534747, 2534497, 2533745, 2533754, 2534368, 2533718, 2534441, 2533810, 2534696, 2534614, 2534357, 2534465, 2533879, 2534896, 2534795, 2533995, 2534700, 2534481, 2534446, 2534012, 2534702, 2534508, 2534286, 2534862, 2534507, 2534239, 2534181, 2533956, 2533828, 2534403, 2534384, 2533755, 2534710, 2533678, 2534828, 2533788, 2533849, 2534564, 2533860, 2534754, 2534634, 2534278, 2534526, 2533703, 2534213, 2534209, 2534341, 2534428, 2534000, 2534927, 2534466, 2534900, 2533620, 2534676, 2533793, 2534635, 2534852, 2534444, 2534706, 2534016, 2534728, 2534585, 2534130, 2533792, 2534054, 2535360, 2535123, 2535407, 2535404, 2535176, 2535373, 2535061, 2534986, 2534966, 2535081, 2535121, 2534992, 2535084, 2535004, 2535239, 2535115, 2535303, 2535183, 2535044, 2535224, 2535173, 2535071, 2535108, 2534987, 2535050, 2535352, 2535091, 2535406, 2535306, 2535411, 2535111, 2535362, 2535078, 2535141, 2534974, 2535425, 2534957, 2535135, 2535265, 2535395, 2534984, 2535073, 2535358, 2535387, 2535327, 2535253, 2535305, 2535031, 2535105, 2535029, 2534995, 2534949, 2535118, 2535102, 2535092, 2535019, 2534991, 2535415, 2534982, 2535443, 2535332, 2534953, 2534952, 2534983, 2535085, 2535096, 2535388, 2535464, 2535426, 2535072, 2535449, 2535330, 2535089, 2535346, 2535120, 2534939, 2535038, 2535444, 2535280, 2535413, 2535035, 2535439, 2535279, 2535451, 2535440, 2535311, 2534962, 2535049, 2535399, 2535047, 2535140, 2535013, 2535323, 2534946, 2535297, 2535094, 2535113, 2534968, 2535066, 2534958]
-        lerobot_episodes = [2536226, 2536013, 2535738, 2536152, 2536393, 2536365, 2536315, 2535724, 2536341, 2535877, 2535988, 2536297, 2536272, 2535961, 2536033, 2536125, 2536049, 2535629, 2535786, 2535759, 2535554, 2535918, 2535497, 2536202, 2536164, 2535763, 2535750, 2535480, 2535563, 2536335, 2536254, 2535551, 2535558, 2535511, 2535906, 2536123, 2535775, 2535841, 2536296, 2536096, 2535739, 2535646, 2536352, 2536184, 2536188, 2536079, 2535783, 2536440, 2536473, 2535997, 2535778, 2535649, 2535650, 2536354, 2536087, 2536012, 2536080, 2536068, 2536133, 2536458, 2535570, 2536376, 2536350, 2536340, 2535652, 2535586, 2536060, 2536454, 2535995, 2535661, 2535859, 2535780, 2536210, 2536106, 2535707, 2535764, 2535903, 2536124, 2535624, 2536100, 2536222, 2535566, 2536346, 2536212, 2535499, 2535647, 2536515, 2535840, 2535745, 2536064, 2536150, 2536146, 2535808, 2536058, 2535581, 2535743, 2536038, 2535482, 2536046, 2535882, 2534305, 2533864, 2534326, 2533614, 2534711, 2534907, 2534026, 2534391, 2534775, 2533898, 2534395, 2533775, 2534577, 2534094, 2534592, 2534869, 2534559, 2533926, 2533855, 2534194, 2534878, 2533873, 2534458, 2534800, 2534436, 2534911, 2534553, 2534129, 2534378, 2533647, 2533777, 2534187, 2534115, 2533991, 2533706, 2534747, 2534497, 2533745, 2533754, 2534368, 2533718, 2534441, 2533810, 2534696, 2534614, 2534357, 2534465, 2533879, 2534896, 2534795, 2533995, 2534700, 2534481, 2534446, 2534012, 2534702, 2534508, 2534286, 2534862, 2534507, 2534239, 2534181, 2533956, 2533828, 2534403, 2534384, 2533755, 2534710, 2533678, 2534828, 2533788, 2533849, 2534564, 2533860, 2534754, 2534634, 2534278, 2534526, 2533703, 2534213, 2534209, 2534341, 2534428, 2534000, 2534927, 2534466, 2534900, 2533620, 2534676, 2533793, 2534635, 2534852, 2534444, 2534706, 2534016, 2534728, 2534585, 2534130, 2533792, 2534054, 2535360, 2535123, 2535407, 2535404, 2535176, 2535373, 2535061, 2534986, 2534966, 2535081, 2535121, 2534992, 2535084, 2535004, 2535239, 2535115, 2535303, 2535183, 2535044, 2535224, 2535173, 2535071, 2535108, 2534987, 2535050, 2535352, 2535091, 2535406, 2535306, 2535411, 2535111, 2535362, 2535078, 2535141, 2534974, 2535425, 2534957, 2535135, 2535265, 2535395, 2534984, 2535073, 2535358, 2535387, 2535327, 2535253, 2535305, 2535031, 2535105, 2535029, 2534995, 2534949, 2535118, 2535102, 2535092, 2535019, 2534991, 2535415, 2534982, 2535443, 2535332, 2534953, 2534952, 2534983, 2535085, 2535096, 2535388, 2535464, 2535426, 2535072, 2535449, 2535330, 2535089, 2535346, 2535120, 2534939, 2535038, 2535444, 2535280, 2535413, 2535035, 2535439, 2535279, 2535451, 2535440, 2535311, 2534962, 2535049, 2535399, 2535047, 2535140, 2535013, 2535323, 2534946, 2535297, 2535094, 2535113, 2534968, 2535066, 2534958]
-        # lerobot_episodes = None
-        lerobot_episode_id = rospy.get_param("~lerobot_episode_id", None)
-        lerobot_video_backend = str(rospy.get_param("~lerobot_video_backend", "pyav"))
-        rospy.loginfo("lerobot_repo_id: %s", lerobot_repo_id)
-        rospy.loginfo("lerobot_episodes: %s", lerobot_episodes)
-        if lerobot_repo_id:
-            rospy.loginfo("Using LeRobotReplayEnv with repo_id=%s, episodes=%s, episode_id=%s, video_backend=%s",
-                lerobot_repo_id, lerobot_episodes, lerobot_episode_id, lerobot_video_backend)
-            if lerobot_episode_id is not None:
-                episodes=[int(x) for x in list(lerobot_episodes)],
-            else:
-                episodes=None
-            env = LeRobotReplayEnv(
-                repo_id=lerobot_repo_id,
-                episodes=episodes,
-                episode_id=int(lerobot_episode_id) if lerobot_episode_id is not None else None,
-                video_backend=lerobot_video_backend,
-                update_freq=execution_freq,
-            )
-        else:
-            rospy.loginfo("random input")
-            env = SyntheticReplayEnv(
-                update_freq=execution_freq,
-            )
+        env = SyntheticReplayEnv(
+            update_freq=execution_freq,
+        )
     else:
         env = HSREnv(update_freq=execution_freq)
     policy = OpenpiPolicy(
@@ -1445,7 +1158,6 @@ def main():
         while not rospy.is_shutdown():
             will_infer = len(policy.action_queue) == 0
             obs = env.get_observations()
-            rospy.loginfo(f"Got observations: keys={list(obs.keys())}, joint_state_ready={'joint_state' in obs}, instruction_ready={'instruction' in obs}")
             if obs is None:
                 can_continue_chunk = (not will_infer) and (env.joint_state is not None) and (upsample or test_mode)
                 if can_continue_chunk:
@@ -1473,16 +1185,12 @@ def main():
                 # If we just consumed the last action of the current chunk, record chunk end time.
                 if (not will_infer) and len(policy.action_queue) == 0:
                     last_chunk_end_t_s = sent_t_s
-            # rospy.loginfo(f"{obs}")
+
             if is_executed and "joint_state" in obs:
                 recorder.add(
                     stamp_s=sent_t_s,
                     joint_state=obs["joint_state"],
                     action=action_to_send,
-                    gt_action=obs.get("gt_action", None),
-                    timestamp=obs.get("timestamp", None),
-                    task=obs.get("instruction", None),
-                    episode_no=obs.get("episode_index", None)
                 )
                 if upsample and will_infer:
                     original_chunk = policy.get_last_original_action_chunk()
@@ -1493,45 +1201,19 @@ def main():
                             action_hz=update_freq,
                         )
 
-            if test_mode and obs.get("done", False):
-                rospy.loginfo("Episode done. Saving exec trace for this episode.")
-                policy.action_queue.clear()  
-                try:
-                    recorder.save_and_plot()
-                except Exception as e:
-                    rospy.logwarn("Failed to save exec trace: %s", e)
-
-                recorder = ExecTraceRecorder(
-                    enabled=save_exec_trace,
-                    config_name=trace_group_name,
-                    joint_dim_names=env.joint_state_names,
-                    base_action_names=env.base_action_names,
-                )
-
-            # Stop after one episode when replay env signals completion.
-            if test_mode and hasattr(env, "is_finished") and env.is_finished():
-                rospy.loginfo("Replay all episodes finished. Shutting down.")
-                try:
-                    policy.log_inference_stats()
-                except Exception:
-                    pass
-                try:
-                    log_chunk_gap_stats()
-                except Exception:
-                    pass
-                try:
-                    rospy.signal_shutdown("Replay finished")
-                except Exception:
-                    pass
-                break
+            # # Debug: dump test images.
+            # cv2.imwrite("/root/catkin_ws/head_rgb.png", obs["head_rgb"])
+            # cv2.imwrite("/root/catkin_ws/hand_rgb.png", obs["hand_rgb"])
+            # # cv2.imshow("hand_rgb", obs["hand_rgb"])
+            # break
 
             if tick % log_interval == 0:
                 if is_executed:
                     rospy.loginfo("Action executed.")
                 else:
                     rospy.loginfo("Action not executed.")
-                # rospy.loginfo("Language instruction: %s", obs.get("instruction", ""))
-                # rospy.loginfo("Action: %s", action)
+                rospy.loginfo("Language instruction: %s", obs.get("instruction", ""))
+                rospy.loginfo("Action: %s", action)
             if not test_mode:
                 if not upsample:
                     env.reset_observation()

@@ -12,7 +12,7 @@ services:
       POLICY_CHECKPOINT_DIR: /policy_checkpoint
       POLICY_DATA_HOME: /policy_assets
       HF_HOME: /policy_hf_cache
-      NVIDIA_VISIBLE_DEVICES: xx
+      NVIDIA_VISIBLE_DEVICES: MIG-84e43beb-ccd8-57ef-a79a-f4a9c451935e
     volumes:
       - ${POLICY_CHECKPOINT_PATH:-./.docker_cache/policy_checkpoint}:/policy_checkpoint:ro
       - ${POLICY_CACHE_DIR:-./.docker_cache/policy_cache}:/policy_assets
@@ -37,11 +37,15 @@ services:
       POLICY_SERVER_HOST: ${POLICY_SERVER_HOST:-127.0.0.1}
       POLICY_SERVER_PORT: ${POLICY_SERVER_PORT:-8000}
       POLICY_SERVER_API_KEY: ${POLICY_SERVER_API_KEY:-}
-      NVIDIA_VISIBLE_DEVICES: xx
+      NVIDIA_VISIBLE_DEVICES: MIG-84e43beb-ccd8-57ef-a79a-f4a9c451935e
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix
       - /dev:/dev
+      - /home/hyamaguchi23/learning_ws/airoa-evaluation-ICRA/deploy/hsr_policy_client:/root/catkin_ws/src/hsr_policy_client:ro
       - ${ROSBAG_DIR:-./datasets/rosbags}:/root/datasets/rosbags
+      - /home/hyamaguchi23/.cache/huggingface/lerobot/airoa-moma/:/root/.cache/huggingface/lerobot/airoa-moma:ro
+      - /mnt/AiroaMomaDataset/:/mnt/AiroaMomaDataset:ro
+      - /mnt/share_for_HPC/:/mnt/share_for_HPC:ro
     command: >-
       bash -lc "
       source /opt/ros/noetic/setup.bash &&

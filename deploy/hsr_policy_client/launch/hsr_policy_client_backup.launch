@@ -6,7 +6,7 @@
     <arg name="policy_server_api_key" default=""/>
     <arg name="update_freq" default="10"/>
     <arg name="adopted_action_chunks" default="10"/>
-    <arg name="upsample" default="false"/>
+    <arg name="upsample" default="true"/>
     <arg name="upsample_hz" default="100"/>
     <arg name="upsample_method" default="spline"/>
     <arg name="action_smoothing" default="ema"/>
@@ -15,11 +15,8 @@
     <arg name="smooth_gripper" default="false"/>
     <arg name="smooth_base" default="false"/>
     <arg name="gripper_mode" default="hybrid"/>
-    <arg name="save_exec_trace" default="true"/>
+    <arg name="save_exec_trace" default="false"/>
     <arg name="test_mode" default="true"/>
-    <arg name="lerobot_repo_id" default="/mnt/share_for_HPC/yano21/wakamatsu_ct_pro"/>
-    <arg name="lerobot_video_backend" default="pyav"/>
-
 
 
     <node name="hsr_policy_client" pkg="hsr_policy_client" type="hsr_policy.py" output="screen">
@@ -40,8 +37,6 @@
         <param name="gripper_mode" value="$(arg gripper_mode)"/>
         <param name="save_exec_trace" value="$(arg save_exec_trace)"/>
         <param name="test_mode" value="$(arg test_mode)"/>
-        <param name="lerobot_repo_id" value="$(arg lerobot_repo_id)"/>
-        <param name="lerobot_video_backend" value="$(arg lerobot_video_backend)"/>
     </node>
 
 </launch>

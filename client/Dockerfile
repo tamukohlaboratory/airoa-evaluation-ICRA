@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake git git-lfs curl wget lsb-release ca-certificates \
     python3 python3-venv python3-pip \
     qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools \
+    clang \
+    libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # ROS Noetic
@@ -49,11 +51,48 @@ RUN mkdir -p /root/catkin_ws/src && \
     source /opt/ros/noetic/setup.bash && \
     cd /root/catkin_ws && catkin build
 
-# Python 3.11 venv for hsr_policy.py (shebang points to /home/policy/.venv/bin/python3).
-RUN uv venv --python 3.11 --seed /home/policy/.venv && \
-    /home/policy/.venv/bin/pip install --no-cache-dir --upgrade pip && \
-    /home/policy/.venv/bin/pip install --no-cache-dir numpy==1.26.4 opencv-python pyyaml rospkg catkin_pkg && \
-    /home/policy/.venv/bin/pip install --no-cache-dir -e /workspace/packages/policy-client
+# # Python 3.11 venv for hsr_policy.py (shebang points to /home/policy/.venv/bin/python3).
+# RUN uv venv --python 3.11 --seed /home/policy/.venv && \
+#     /home/policy/.venv/bin/pip install --no-cache-dir --upgrade pip && \
+#     /home/policy/.venv/bin/pip install --no-cache-dir numpy==1.26.4 opencv-python pyyaml rospkg catkin_pkg && \
+#     /home/policy/.venv/bin/pip install --no-cache-dir -e /workspace/packages/policy-client && \
+#     # lerobot_v3.0用
+#     # /home/policy/.venv/bin/pip install --no-cache-dir lerobot && \
+#     # ===============================================
+
+#     # /home/policy/.venv/bin/pip install --no-cache-dir matplotlib && \
+#     # /home/policy/.venv/bin/pip install -v --no-cache-dir "git+https://github.com/tamukohlaboratory/lerobot.git" && \
+#     # /home/policy/.venv/bin/pip install -v --no-cache-dir datasets==3.6.0
+#     /home/policy/.venv/bin/pip install --no-cache-dir matplotlib
+
+# RUN --mount=type=cache,target=/root/.cache/pip \
+#     uv venv --python 3.11 --seed /home/policy/.venv && \
+#     /home/policy/.venv/bin/pip install --upgrade pip && \
+#     /home/policy/.venv/bin/pip install -v numpy==1.26.4 opencv-python pyyaml rospkg catkin_pkg && \
+#     /home/policy/.venv/bin/pip install -e /workspace/packages/policy-client && \
+#     /home/policy/.venv/bin/pip install -v "git+https://github.com/tamukohlaboratory/lerobot.git" && \
+#     /home/policy/.venv/bin/pip install -v datasets==3.6.0 && \
+#     /home/policy/.venv/bin/pip install -v matplotlib
+
+RUN uv venv --python 3.11 --seed /home/policy/.venv
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /home/policy/.venv/bin/pip install --upgrade pip && \
+    /home/policy/.venv/bin/pip install -v \
+      numpy==1.26.4 \
+      opencv-python \
+      pyyaml \
+      rospkg \
+      catkin_pkg \
+      datasets==3.6.0 \
+      matplotlib
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /home/policy/.venv/bin/pip install -v \
+      "git+https://github.com/tamukohlaboratory/lerobot.git"
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /home/policy/.venv/bin/pip install -e /workspace/packages/policy-client
 
 COPY client/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
