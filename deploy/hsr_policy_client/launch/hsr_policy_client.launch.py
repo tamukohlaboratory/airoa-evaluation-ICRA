@@ -1,16 +1,26 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description() -> LaunchDescription:
     declared_arguments = [
+        DeclareLaunchArgument("instruction", default_value="Grasp the apple."),
         DeclareLaunchArgument("config_name", default_value="remote_policy"),
-        DeclareLaunchArgument("policy_server_host", default_value="127.0.0.1"),
-        DeclareLaunchArgument("policy_server_port", default_value="8000"),
-        DeclareLaunchArgument("policy_server_api_key", default_value=""),
+        DeclareLaunchArgument(
+            "policy_server_host",
+            default_value=EnvironmentVariable("POLICY_SERVER_HOST", default_value="127.0.0.1"),
+        ),
+        DeclareLaunchArgument(
+            "policy_server_port",
+            default_value=EnvironmentVariable("POLICY_SERVER_PORT", default_value="8000"),
+        ),
+        DeclareLaunchArgument(
+            "policy_server_api_key",
+            default_value=EnvironmentVariable("POLICY_SERVER_API_KEY", default_value=""),
+        ),
         DeclareLaunchArgument("update_freq", default_value="10"),
         DeclareLaunchArgument("adopted_action_chunks", default_value="10"),
         DeclareLaunchArgument("upsample", default_value="true"),
@@ -22,11 +32,14 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("smooth_gripper", default_value="false"),
         DeclareLaunchArgument("smooth_base", default_value="false"),
         DeclareLaunchArgument("gripper_mode", default_value="hybrid"),
+        DeclareLaunchArgument("require_control_mode", default_value="false"),
+        DeclareLaunchArgument("expected_control_mode", default_value="auto"),
         DeclareLaunchArgument("save_exec_trace", default_value="false"),
         DeclareLaunchArgument("test_mode", default_value="true"),
     ]
 
     parameters = {
+        "instruction": LaunchConfiguration("instruction"),
         "config_name": LaunchConfiguration("config_name"),
         "policy_server_host": LaunchConfiguration("policy_server_host"),
         "policy_server_port": ParameterValue(LaunchConfiguration("policy_server_port"), value_type=int),
@@ -42,6 +55,8 @@ def generate_launch_description() -> LaunchDescription:
         "smooth_gripper": ParameterValue(LaunchConfiguration("smooth_gripper"), value_type=bool),
         "smooth_base": ParameterValue(LaunchConfiguration("smooth_base"), value_type=bool),
         "gripper_mode": LaunchConfiguration("gripper_mode"),
+        "require_control_mode": ParameterValue(LaunchConfiguration("require_control_mode"), value_type=bool),
+        "expected_control_mode": LaunchConfiguration("expected_control_mode"),
         "save_exec_trace": ParameterValue(LaunchConfiguration("save_exec_trace"), value_type=bool),
         "test_mode": ParameterValue(LaunchConfiguration("test_mode"), value_type=bool),
     }

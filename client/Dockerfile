@@ -16,12 +16,33 @@ RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc | g
     python3-colcon-common-extensions \
     python3-rosdep \
     ros-humble-desktop \
+    ros-humble-rmw-cyclonedds-cpp \
     ros-humble-rosidl-default-generators \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rosdep init || true && rosdep update || true
 
 WORKDIR /workspace
+
+# Keep Python dependency installation in a stable layer so deploy-side changes
+# do not force a full redownload on every image rebuild.
+COPY packages/policy-client/pyproject.toml ./packages/policy-client/pyproject.toml
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv venv --python 3.10 --seed /home/policy/.venv && \
+    uv pip install --link-mode=copy --python /home/policy/.venv/bin/python \
+    "dm-tree>=0.1.8" \
+    "msgpack>=1.0.5" \
+    "numpy==1.26.4" \
+    "opencv-python" \
+    "pillow>=9.0.0" \
+    "pyyaml" \
+    "rospkg>=1.6.1" \
+    "catkin_pkg" \
+    "tree>=0.2.4" \
+    "typing_extensions>=4.0.0" \
+    "websockets>=11.0"
+
 COPY deploy ./deploy
 COPY packages/policy-client ./packages/policy-client
 
@@ -34,10 +55,8 @@ RUN mkdir -p /root/ros2_ws/src && \
     rosdep install --from-paths src --ignore-src -r -y --rosdistro humble && \
     colcon build --merge-install
 
-RUN uv venv --python 3.10 --seed /home/policy/.venv && \
-    /home/policy/.venv/bin/pip install --no-cache-dir --upgrade pip && \
-    /home/policy/.venv/bin/pip install --no-cache-dir numpy==1.26.4 opencv-python pyyaml rospkg catkin_pkg && \
-    /home/policy/.venv/bin/pip install --no-cache-dir -e /workspace/packages/policy-client
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --link-mode=copy --python /home/policy/.venv/bin/python --no-deps -e /workspace/packages/policy-client
 
 COPY client/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
