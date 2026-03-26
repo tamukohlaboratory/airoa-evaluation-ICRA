@@ -14,95 +14,6 @@ is_true() {
   esac
 }
 
-resolve_hsr_ip() {
-  if [[ -n "${HSR_IP:-}" ]]; then
-    echo "${HSR_IP}"
-    return 0
-  fi
-
-  if [[ -n "${ROBOT_NAME:-}" ]]; then
-    local name="${ROBOT_NAME}"
-    local ip=""
-
-    ip="$(getent hosts "${name}" | awk '{ print $1 }' || true)"
-    if [[ -n "${ip}" ]]; then
-      echo "${ip}"
-      return 0
-    fi
-
-    if command -v avahi-resolve >/dev/null 2>&1; then
-      ip="$(avahi-resolve -4 --name "${name}.local" 2>/dev/null | cut -f 2 || true)"
-      if [[ -n "${ip}" ]]; then
-        echo "${ip}"
-        return 0
-      fi
-    fi
-  fi
-
-  return 1
-}
-
-ensure_ros_master_uri() {
-  if [[ -n "${ROS_MASTER_URI:-}" ]]; then
-    return 0
-  fi
-
-  local hsr_ip=""
-  if hsr_ip="$(resolve_hsr_ip)"; then
-    export ROS_MASTER_URI="http://${hsr_ip}:11311"
-    echo "[INFO] ROS_MASTER_URI is not set. Using ${ROS_MASTER_URI}"
-    return 0
-  fi
-
-  echo "[ERROR] ROS_MASTER_URI is not set."
-  echo "Set one of the following before running:"
-  echo "  1) export ROS_MASTER_URI=http://<HSR_IP>:11311"
-  echo "  2) export HSR_IP=<HSR_IP>"
-  echo "  3) export ROBOT_NAME=<hsrbxxx>"
-  exit 1
-}
-
-ensure_ros_ip() {
-  if [[ -n "${ROS_IP:-}" ]]; then
-    return 0
-  fi
-
-  local ips=()
-  if command -v ifconfig >/dev/null 2>&1; then
-    while IFS= read -r ip; do
-      [[ -z "${ip}" ]] && continue
-      [[ "${ip}" == 127.* ]] && continue
-      ips+=("${ip}")
-    done < <(ifconfig | awk '/inet / {print $2}')
-  else
-    while IFS= read -r ip; do
-      [[ -z "${ip}" ]] && continue
-      [[ "${ip}" == 127.* ]] && continue
-      ips+=("${ip}")
-    done < <(ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1)
-  fi
-
-  if [[ ${#ips[@]} -eq 0 ]]; then
-    echo "[ERROR] ROS_IP is not set and no candidate host IP was found."
-    exit 1
-  fi
-
-  if [[ ! -t 0 ]]; then
-    echo "[ERROR] ROS_IP is not set and this shell is non-interactive."
-    echo "Set it explicitly: export ROS_IP=<YOUR_HOST_IP>"
-    exit 1
-  fi
-
-  echo "ROS_IP is not set. Choose host IP for ROS nodes:"
-  select ip in "${ips[@]}"; do
-    if [[ -n "${ip:-}" ]]; then
-      export ROS_IP="${ip}"
-      echo "[INFO] Using ROS_IP=${ROS_IP}"
-      break
-    fi
-  done
-}
-
 ensure_paths() {
   : "${POLICY_CACHE_DIR:=${PWD}/.docker_cache/policy_cache}"
   : "${HF_CACHE_DIR:=${PWD}/.docker_cache/hf}"
@@ -122,30 +33,37 @@ ensure_paths() {
   mkdir -p "${POLICY_CACHE_DIR}" "${HF_CACHE_DIR}" "${ROSBAG_DIR}"
 }
 
+ensure_ros2_network_env() {
+  : "${ROS_DOMAIN_ID:=0}"
+
+  if [[ -z "${ROS_LOCALHOST_ONLY:-}" ]]; then
+    if is_true "${TEST_MODE:-true}"; then
+      ROS_LOCALHOST_ONLY=1
+    else
+      ROS_LOCALHOST_ONLY=0
+    fi
+  fi
+
+  export ROS_DOMAIN_ID
+  export ROS_LOCALHOST_ONLY
+}
+
 print_env_summary() {
-  echo "[INFO] ROS_MASTER_URI=${ROS_MASTER_URI:-}"
-  echo "[INFO] ROS_IP=${ROS_IP:-}"
   echo "[INFO] TEST_MODE=${TEST_MODE:-true}"
+  echo "[INFO] ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}"
+  echo "[INFO] ROS_LOCALHOST_ONLY=${ROS_LOCALHOST_ONLY:-0}"
   echo "[INFO] POLICY_CHECKPOINT_PATH=${POLICY_CHECKPOINT_PATH:-}"
   echo "[INFO] POLICY_CACHE_DIR=${POLICY_CACHE_DIR:-}"
   echo "[INFO] HF_CACHE_DIR=${HF_CACHE_DIR:-}"
   echo "[INFO] ROSBAG_DIR=${ROSBAG_DIR:-}"
   echo "[INFO] POLICY_SERVER_HOST=${POLICY_SERVER_HOST:-127.0.0.1}"
   echo "[INFO] POLICY_SERVER_PORT=${POLICY_SERVER_PORT:-8000}"
+  echo "[INFO] POLICY_SERVER_API_KEY set=$([[ -n "${POLICY_SERVER_API_KEY:-}" ]] && echo true || echo false)"
 }
 
 cmd_up() {
-  if is_true "${TEST_MODE:-true}"; then
-    export ROS_MASTER_URI="${ROS_MASTER_URI:-http://127.0.0.1:11311}"
-    export ROS_IP="${ROS_IP:-127.0.0.1}"
-    echo "[INFO] TEST_MODE=true: skipping HSR network checks."
-    echo "[INFO] Using ROS_MASTER_URI=${ROS_MASTER_URI}"
-    echo "[INFO] Using ROS_IP=${ROS_IP}"
-  else
-    ensure_ros_master_uri
-    ensure_ros_ip
-  fi
   ensure_paths
+  ensure_ros2_network_env
   print_env_summary
   docker compose up --build -d
   echo "[INFO] Containers started."
@@ -164,18 +82,23 @@ cmd_shell() {
     -e POLICY_SERVER_PORT="${POLICY_SERVER_PORT:-8000}" \
     -e POLICY_SERVER_API_KEY="${POLICY_SERVER_API_KEY:-}" \
     -e TEST_MODE="${TEST_MODE:-true}" \
+    -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}" \
+    -e ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-0}" \
     "${container_name}" bash -lc '
-source /opt/ros/noetic/setup.bash
-source /root/catkin_ws/devel/setup.bash
-echo "[INFO] ROS environment loaded."
+source /opt/ros/humble/setup.bash
+source /root/ros2_ws/install/setup.bash
+export PATH="/home/policy/.venv/bin:${PATH}"
+export PYTHONPATH="/workspace/packages/policy-client/src:${PYTHONPATH:-}"
+echo "[INFO] ROS 2 environment loaded."
 echo "[INFO] Run inside this shell:"
-echo "roslaunch hsr_policy_client hsr_policy_client.launch"
+echo "ros2 launch hsr_policy_client hsr_policy_client.launch.py test_mode:=${TEST_MODE:-true}"
+if [[ "${TEST_MODE:-true}" == "false" ]]; then echo "[INFO] See REAL_ROBOT_CHECKLIST.md before running on hardware."; fi
 exec bash
 '
 }
 
 cmd_launch() {
-  echo "[INFO] Opening hsr_client shell. Run roslaunch inside the container."
+  echo "[INFO] Opening hsr_client shell. Run ros2 launch inside the container."
   cmd_shell
 }
 

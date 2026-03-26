@@ -1,26 +1,23 @@
-cmake_minimum_required(VERSION 3.0.2)
+cmake_minimum_required(VERSION 3.8)
 project(hsr_policy_client)
 
-find_package(catkin REQUIRED COMPONENTS
-  geometry_msgs
-  message_generation
-  rospy
-  sensor_msgs
+find_package(ament_cmake REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(hsr_policy_client_interfaces REQUIRED)
+find_package(rclpy REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(tmc_control_msgs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
+
+install(PROGRAMS
+  scripts/hsr_policy.py
+  DESTINATION lib/${PROJECT_NAME}
 )
 
-add_service_files(
-  DIRECTORY srv
-  FILES
-    StringTrigger.srv
+install(DIRECTORY
+  launch
+  DESTINATION share/${PROJECT_NAME}
 )
 
-generate_messages()
-
-catkin_package(
-  CATKIN_DEPENDS
-    message_runtime
-)
-
-include_directories(
-  ${catkin_INCLUDE_DIRS}
-)
+ament_package()

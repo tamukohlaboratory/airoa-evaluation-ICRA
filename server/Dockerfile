@@ -27,4 +27,6 @@ COPY runtime_core ./runtime_core
 ENV PATH="/workspace/.venv/bin:${PATH}"
 ENV PYTHONPATH="/workspace:/workspace/src:/workspace/packages/policy-client/src"
 
+RUN chmod +x /workspace/server/entrypoint.sh
+
 ENTRYPOINT ["/workspace/server/entrypoint.sh"]

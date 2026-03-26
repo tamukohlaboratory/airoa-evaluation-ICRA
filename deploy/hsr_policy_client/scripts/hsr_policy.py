@@ -1,29 +1,47 @@
-#!/home/policy/.venv/bin/python3
+#!/usr/bin/env python3
 from collections import deque
+import threading
 
 import os
 import re
 import time
 from typing import Any, Optional
 
-from actionlib import SimpleActionClient
 import cv2
 from geometry_msgs.msg import Twist
-from hsr_policy_client.srv import StringTrigger
-from hsr_policy_client.srv import StringTriggerResponse
 import numpy as np
-
-# ROS-related imports
-import rospy
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage
 from sensor_msgs.msg import JointState
-from std_msgs.msg import String 
-from tmc_control_msgs.msg import GripperApplyEffortAction
-from tmc_control_msgs.msg import GripperApplyEffortActionGoal
+from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
 
+from hsr_policy_client_interfaces.srv import StringTrigger
 from policy_client.websocket_client_policy import WebsocketClientPolicy
+from tmc_control_msgs.action import GripperApplyEffort
+
+
+def _fmt_log(msg: str, *args: Any) -> str:
+    if not args:
+        return str(msg)
+    try:
+        return str(msg) % args
+    except Exception:
+        return " ".join([str(msg)] + [str(arg) for arg in args])
+
+
+def _loginfo(logger: Any, msg: str, *args: Any) -> None:
+    logger.info(_fmt_log(msg, *args))
+
+
+def _logwarn(logger: Any, msg: str, *args: Any) -> None:
+    logger.warning(_fmt_log(msg, *args))
 
 
 MODE_CONTINUOUS = "continuous"
@@ -294,14 +312,17 @@ class ActionSmoother:
     def __init__(
         self,
         *,
+        logger: Any,
         method: str,
         ema_alpha: float,
         ma_window: int,
         dims_mask: np.ndarray,
     ):
+        self.logger = logger
         self.method = str(method)
         if self.method not in ACTION_SMOOTHING_METHODS:
-            rospy.logwarn(
+            _logwarn(
+                self.logger,
                 "Unknown action_smoothing '%s'. Falling back to '%s'. Available: %s",
                 self.method,
                 ACTION_SMOOTHING_NONE,
@@ -323,7 +344,6 @@ class ActionSmoother:
             return action
 
         if self.dims_mask.shape[0] != action.shape[0]:
-            # If shape mismatch, fall back to smoothing all dims.
             mask = np.ones_like(action, dtype=bool)
         else:
             mask = self.dims_mask
@@ -338,7 +358,6 @@ class ActionSmoother:
             out[mask] = self._ema_state[mask]
             return out
 
-        # Moving average
         self._ma_buf.append(action)
         if len(self._ma_buf) == 0:
             return out
@@ -357,22 +376,57 @@ def _param_to_bool(value: Any) -> bool:
     return bool(value)
 
 
+class HSRPolicyClientNode(Node):
+    DEFAULT_PARAMETERS = [
+        ("instruction", "Grasp the apple."),
+        ("config_name", "remote_policy"),
+        ("policy_server_host", "127.0.0.1"),
+        ("policy_server_port", 8000),
+        ("policy_server_api_key", ""),
+        ("adopted_action_chunks", 1),
+        ("update_freq", 5),
+        ("upsample", False),
+        ("upsample_hz", 50),
+        ("upsample_method", UPSAMPLE_METHOD_SPLINE),
+        ("action_smoothing", ACTION_SMOOTHING_NONE),
+        ("ema_alpha", 0.2),
+        ("ma_window", 5),
+        ("smooth_gripper", False),
+        ("smooth_base", False),
+        ("gripper_mode", "continuous"),
+        ("test_mode", True),
+        ("save_exec_trace", False),
+    ]
+
+    def __init__(self):
+        super().__init__("hsr_policy_client")
+        self.declare_parameters(namespace="", parameters=self.DEFAULT_PARAMETERS)
+
+    def param(self, name: str) -> Any:
+        clean_name = str(name)
+        if clean_name.startswith("~"):
+            clean_name = clean_name[1:]
+        return self.get_parameter(clean_name).value
+
+
 class SyntheticReplayEnv:
     """Environment for synthetic test-mode replay without requiring a robot."""
 
     def __init__(
         self,
+        node: HSRPolicyClientNode,
         *,
         update_freq: int = 10,
     ):
-        self.update_freq = int(update_freq)
-        self.rate = rospy.Rate(self.update_freq)
+        self.node = node
+        self.update_freq = max(int(update_freq), 1)
+        self.sleep_period_s = 1.0 / float(self.update_freq)
         self.image_height = SYNTH_TEST_IMAGE_HEIGHT
         self.image_width = SYNTH_TEST_IMAGE_WIDTH
         self.random_seed = SYNTH_TEST_RANDOM_SEED
         self._rng = np.random.default_rng(self.random_seed)
 
-        self.instruction = str(rospy.get_param("~instruction", "Grasp the apple."))
+        self.instruction = str(self.node.param("instruction"))
         self.gripper_state = 0
         self.control_mode = "auto"
         self.joint_state: Optional[np.ndarray] = None
@@ -390,18 +444,24 @@ class SyntheticReplayEnv:
         ]
         self.base_action_names: list[str] = ["base_x", "base_y", "base_theta"]
 
-        rospy.Service("/hsr_policy_client/update_instruction", StringTrigger, self.update_instruction_srv)
-        rospy.loginfo(
+        self._instruction_service = self.node.create_service(
+            StringTrigger,
+            "/hsr_policy_client/update_instruction",
+            self.update_instruction_srv,
+        )
+        _loginfo(
+            self.node.get_logger(),
             "Test mode enabled. Using synthetic random data image=%dx%d seed=%d (infinite loop)",
             self.image_height,
             self.image_width,
             self.random_seed,
         )
 
-    def update_instruction_srv(self, req: StringTrigger):
-        self.instruction = req.message
-        rospy.loginfo("Instruction updated: %s", self.instruction)
-        return StringTriggerResponse(success=True)
+    def update_instruction_srv(self, request: StringTrigger.Request, response: StringTrigger.Response):
+        self.instruction = request.message
+        response.success = True
+        _loginfo(self.node.get_logger(), "Instruction updated: %s", self.instruction)
+        return response
 
     def is_finished(self) -> bool:
         return False
@@ -438,31 +498,31 @@ class SyntheticReplayEnv:
         return True
 
     def sleep(self):
-        self.rate.sleep()
+        time.sleep(self.sleep_period_s)
 
 
 class HSREnv:
     """
-    Runtime environment class that receives HSR sensor observations via ROS
+    Runtime environment class that receives HSR sensor observations via ROS 2
     and applies actions to the robot.
     """
 
     GRIPPER_OPEN = 1
     GRIPPER_CLOSE = 0
-    GRIPPER_CLOSE_THRESHOLD = 0.5  # Threshold to trigger gripper close behavior.
+    GRIPPER_CLOSE_THRESHOLD = 0.5
 
-    def __init__(self, update_freq=10):
-        self.update_freq = update_freq
-        self.rate = rospy.Rate(self.update_freq)
+    def __init__(self, node: HSRPolicyClientNode, update_freq: int = 10):
+        self.node = node
+        self.update_freq = max(int(update_freq), 1)
+        self.sleep_period_s = 1.0 / float(self.update_freq)
 
-        # Initialize sensor and runtime state.
-        self.head_rgb = None
-        self.hand_rgb = None
-        self.joint_state = None
+        self.head_rgb: Optional[np.ndarray] = None
+        self.hand_rgb: Optional[np.ndarray] = None
+        self.joint_state: Optional[np.ndarray] = None
         self.gripper_state = 0
-        self.control_mode = None
-        self.gripper_mode = rospy.get_param("~gripper_mode", "continuous")
-        self.instruction = rospy.get_param("~instruction", "Grasp the apple.")
+        self.control_mode: Optional[str] = None
+        self.gripper_mode = str(self.node.param("gripper_mode"))
+        self.instruction = str(self.node.param("instruction"))
 
         self.joint_state_names: list[str] = [
             "arm_lift_joint",
@@ -485,78 +545,89 @@ class HSREnv:
         self.head_action_names: list[str] = ["head_pan_joint", "head_tilt_joint"]
         self.base_action_names: list[str] = ["base_x", "base_y", "base_theta"]
 
-        # Initialize publishers.
-        self.arm_pub = rospy.Publisher("/hsrb/arm_trajectory_controller/command", JointTrajectory, queue_size=1)
-        self.head_pub = rospy.Publisher("/hsrb/head_trajectory_controller/command", JointTrajectory, queue_size=1)
-        self.gripper_pub = rospy.Publisher("/hsrb/gripper_controller/command", JointTrajectory, queue_size=1)
-        self.base_pub = rospy.Publisher("/hsrb/command_velocity", Twist, queue_size=1)
-        self.gripper_close_client = SimpleActionClient("/hsrb/gripper_controller/grasp", GripperApplyEffortAction)
+        self.arm_pub = self.node.create_publisher(JointTrajectory, "/hsrb/arm_trajectory_controller/command", 1)
+        self.head_pub = self.node.create_publisher(JointTrajectory, "/hsrb/head_trajectory_controller/command", 1)
+        self.gripper_pub = self.node.create_publisher(JointTrajectory, "/hsrb/gripper_controller/command", 1)
+        self.base_pub = self.node.create_publisher(Twist, "/hsrb/command_velocity", 1)
+        self.gripper_close_client = ActionClient(self.node, GripperApplyEffort, "/hsrb/gripper_controller/grasp")
+        self._latest_gripper_goal_future = None
+        self._warned_missing_gripper_server = False
 
-        # Register service (language instruction update).
-        rospy.Service("/hsr_policy_client/update_instruction", StringTrigger, self.update_instruction_srv)
+        self._instruction_service = self.node.create_service(
+            StringTrigger,
+            "/hsr_policy_client/update_instruction",
+            self.update_instruction_srv,
+        )
 
-        # Initialize subscribers.
-        rospy.Subscriber(
-            "/hsrb/head_rgbd_sensor/rgb/image_rect_color/compressed",
+        self._head_sub = self.node.create_subscription(
             CompressedImage,
+            "/hsrb/head_rgbd_sensor/rgb/image_rect_color/compressed",
             self.head_image_callback,
-            queue_size=1,
+            qos_profile_sensor_data,
         )
-        rospy.Subscriber(
-            "/hsrb/hand_camera/image_raw/compressed", CompressedImage, self.hand_image_callback, queue_size=1
+        self._hand_sub = self.node.create_subscription(
+            CompressedImage,
+            "/hsrb/hand_camera/image_raw/compressed",
+            self.hand_image_callback,
+            qos_profile_sensor_data,
         )
-        rospy.Subscriber("/hsrb/joint_states", JointState, self.joint_state_callback, queue_size=1)
-        rospy.Subscriber("/hsrb/gripper_controller/command", JointTrajectory, self.gripper_open_callback, queue_size=1)
-        rospy.Subscriber(
-            "/hsrb/gripper_controller/grasp/goal",
-            GripperApplyEffortActionGoal,
-            self.gripper_close_callback,
-            queue_size=1,
+        self._joint_sub = self.node.create_subscription(
+            JointState,
+            "/hsrb/joint_states",
+            self.joint_state_callback,
+            qos_profile_sensor_data,
         )
-        rospy.Subscriber("/control_mode", String, self.control_mode_callback, queue_size=1)
+        self._gripper_open_sub = self.node.create_subscription(
+            JointTrajectory,
+            "/hsrb/gripper_controller/command",
+            self.gripper_open_callback,
+            1,
+        )
+        self._control_mode_sub = self.node.create_subscription(
+            String,
+            "/control_mode",
+            self.control_mode_callback,
+            1,
+        )
 
     def head_image_callback(self, msg: CompressedImage):
         np_arr = np.frombuffer(msg.data, np.uint8)
-        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)[:, :, :]  # bgr -> rgb
+        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)[:, :, :]
         self.head_rgb = np.array(image)
 
     def hand_image_callback(self, msg: CompressedImage):
         np_arr = np.frombuffer(msg.data, np.uint8)
-        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)[:, :, :]  # bgr -> rgb
+        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)[:, :, :]
         self.hand_rgb = np.array(image)
 
     def joint_state_callback(self, msg: JointState):
-        joints = [msg.position[msg.name.index(name)] for name in self.joint_state_names]
+        name_to_index = {name: idx for idx, name in enumerate(msg.name)}
+        try:
+            joints = [msg.position[name_to_index[name]] for name in self.joint_state_names]
+        except KeyError:
+            return
         self.joint_state = np.asarray(joints, dtype=np.float32)
 
     def gripper_open_callback(self, msg: JointTrajectory):
+        _ = msg
         self.gripper_state = self.GRIPPER_OPEN
-
-    def gripper_close_callback(self, msg: GripperApplyEffortActionGoal):
-        self.gripper_state = self.GRIPPER_CLOSE
 
     def control_mode_callback(self, msg: String):
         self.control_mode = msg.data
 
-    def update_instruction_srv(self, req: StringTrigger):
-        self.instruction = req.message
-        rospy.loginfo("Instruction updated: %s", self.instruction)
-        return StringTriggerResponse(success=True)
+    def update_instruction_srv(self, request: StringTrigger.Request, response: StringTrigger.Response):
+        self.instruction = request.message
+        response.success = True
+        _loginfo(self.node.get_logger(), "Instruction updated: %s", self.instruction)
+        return response
 
     def reset_observation(self, *, reset_joint_state: bool = True):
-        """
-        Reset cached sensor observations.
-        """
         self.head_rgb = None
         self.hand_rgb = None
         if reset_joint_state:
             self.joint_state = None
 
     def get_observations(self):
-        """
-        Return a dictionary of current robot observations.
-        Returns None until all required observation fields are available.
-        """
         if self.head_rgb is None or self.hand_rgb is None or self.joint_state is None:
             return None
         return {
@@ -568,125 +639,94 @@ class HSREnv:
             "control_mode": self.control_mode,
         }
 
+    def _send_gripper_close_goal(self, effort: float) -> None:
+        goal = GripperApplyEffort.Goal()
+        goal.effort = float(effort)
+        goal.do_control_stop = False
+        if not self.gripper_close_client.wait_for_server(timeout_sec=0.0):
+            if not self._warned_missing_gripper_server:
+                _logwarn(self.node.get_logger(), "Gripper action server is not available: /hsrb/gripper_controller/grasp")
+                self._warned_missing_gripper_server = True
+            return
+        self._latest_gripper_goal_future = self.gripper_close_client.send_goal_async(goal)
+        self._warned_missing_gripper_server = False
+
     def execute_actions(self, action: np.ndarray) -> bool:
-        """
-        Apply an action vector to the robot.
-
-        Parameters
-        ----------
-        action : np.ndarray
-            Action to apply to the robot:
-            [
-                "arm_lift_joint",
-                "arm_flex_joint",
-                "arm_roll_joint",
-                "wrist_flex_joint",
-                "wrist_roll_joint",
-                "hand_motor_joint",
-                "head_pan_joint",
-                "head_tilt_joint",
-                "base_x",
-                "base_y",
-                "base_t",
-            ]
-
-        Returns
-        -------
-        bool
-            True if action execution is allowed and sent, otherwise False.
-        """
-        # Execute only when control_mode is set to "auto".
-        # TODO: ここをコメントアウトしないと実機が動かない（編集不可ファイルなので，提出時には戻す必要あり）
         if self.control_mode != "auto":
-            return False  # Return False when execution is not allowed.
+            return False
 
-        # Arm control.
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+
         arm_traj = JointTrajectory()
         arm_traj.joint_names = self.arm_action_names
         arm_point = JointTrajectoryPoint()
-        arm_point.positions = action[:5]
+        arm_point.positions = action[:5].astype(np.float64).tolist()
         arm_point.velocities = []
-        arm_point.time_from_start = rospy.Duration(1 / self.update_freq / 2)
+        arm_point.time_from_start = Duration(seconds=1.0 / float(self.update_freq) / 2.0).to_msg()
         arm_traj.points = [arm_point]
 
-        # Head control.
         head_traj = JointTrajectory()
         head_traj.joint_names = self.head_action_names
-        arm_point = JointTrajectoryPoint()
-        arm_point.positions = action[6:8]
-        arm_point.velocities = []
-        arm_point.time_from_start = rospy.Duration(1 / self.update_freq / 2)
+        head_point = JointTrajectoryPoint()
+        head_point.positions = action[6:8].astype(np.float64).tolist()
+        head_point.velocities = []
+        head_point.time_from_start = Duration(seconds=1.0 / float(self.update_freq) / 2.0).to_msg()
+        head_traj.points = [head_point]
 
-        head_traj.points = [arm_point]
-
-        # Base control.
         twist = Twist()
-        twist.linear.x = action[8]
-        twist.linear.y = action[9]
-        twist.angular.z = action[10]
+        twist.linear.x = float(action[8])
+        twist.linear.y = float(action[9])
+        twist.angular.z = float(action[10])
 
-        # Gripper control.
         if self.gripper_mode == "continuous":
             gripper_traj = JointTrajectory()
             gripper_traj.joint_names = ["hand_motor_joint"]
-            arm_point = JointTrajectoryPoint()
-            gripper_value = np.clip(action[5], -0.1, 1.23)
-            arm_point.positions = [gripper_value]
-            arm_point.velocities = []
-            arm_point.time_from_start = rospy.Duration(1)
-            gripper_traj.points = [arm_point]
+            gripper_point = JointTrajectoryPoint()
+            gripper_value = float(np.clip(action[5], -0.1, 1.23))
+            gripper_point.positions = [gripper_value]
+            gripper_point.velocities = []
+            gripper_point.time_from_start = Duration(seconds=1.0).to_msg()
+            gripper_traj.points = [gripper_point]
             self.gripper_pub.publish(gripper_traj)
         elif self.gripper_mode == "discrete":
-            # Decide whether to close the gripper: 1=close, 0=open.
             gripper_action = self.GRIPPER_CLOSE if action[5] < self.GRIPPER_CLOSE_THRESHOLD else self.GRIPPER_OPEN
             if self.gripper_state != gripper_action:
-                if gripper_action == self.GRIPPER_CLOSE:  # Close gripper.
-                    goal = GripperApplyEffortActionGoal()
-                    goal.goal.effort = -0.018
-                    self.gripper_close_client.send_goal(goal.goal)
-                else:  # Open gripper.
-                    arm_traj = JointTrajectory()
-                    arm_traj.joint_names = ["hand_motor_joint"]
-                    arm_point = JointTrajectoryPoint()
-                    arm_point.positions = [1.239183768915874]
-                    arm_point.velocities = []
-                    arm_point.time_from_start = rospy.Duration(1)
-                    arm_traj.points = [arm_point]
-                    self.gripper_pub.publish(arm_traj)
+                if gripper_action == self.GRIPPER_CLOSE:
+                    self._send_gripper_close_goal(effort=-0.018)
+                else:
+                    gripper_traj = JointTrajectory()
+                    gripper_traj.joint_names = ["hand_motor_joint"]
+                    gripper_point = JointTrajectoryPoint()
+                    gripper_point.positions = [1.239183768915874]
+                    gripper_point.velocities = []
+                    gripper_point.time_from_start = Duration(seconds=1.0).to_msg()
+                    gripper_traj.points = [gripper_point]
+                    self.gripper_pub.publish(gripper_traj)
                 self.gripper_state = gripper_action
         elif self.gripper_mode == "hybrid":
-            # Hybrid mode:
-            # - Closing: continuous above threshold, discrete below threshold.
-            # - Opening: same behavior as continuous mode.
-            gripper_value = action[5]
+            gripper_value = float(action[5])
             if gripper_value < self.GRIPPER_CLOSE_THRESHOLD:
-                # Below threshold: same behavior as discrete mode (apply grasp effort).
                 if self.gripper_state != self.GRIPPER_CLOSE:
-                    goal = GripperApplyEffortActionGoal()
-                    goal.goal.effort = -0.018
-                    self.gripper_close_client.send_goal(goal.goal)
+                    self._send_gripper_close_goal(effort=-0.018)
                     self.gripper_state = self.GRIPPER_CLOSE
             else:
-                # Above threshold: same behavior as continuous mode.
                 gripper_traj = JointTrajectory()
                 gripper_traj.joint_names = ["hand_motor_joint"]
-                arm_point = JointTrajectoryPoint()
-                gripper_value = np.clip(gripper_value, -0.1, 1.23)
-                arm_point.positions = [gripper_value]
-                arm_point.velocities = []
-                arm_point.time_from_start = rospy.Duration(1)
-                gripper_traj.points = [arm_point]
+                gripper_point = JointTrajectoryPoint()
+                gripper_point.positions = [float(np.clip(gripper_value, -0.1, 1.23))]
+                gripper_point.velocities = []
+                gripper_point.time_from_start = Duration(seconds=1.0).to_msg()
+                gripper_traj.points = [gripper_point]
                 self.gripper_pub.publish(gripper_traj)
                 self.gripper_state = self.GRIPPER_OPEN
 
         self.arm_pub.publish(arm_traj)
         self.head_pub.publish(head_traj)
         self.base_pub.publish(twist)
-
         return True
 
     def sleep(self):
-        self.rate.sleep()
+        time.sleep(self.sleep_period_s)
 
 
 class OpenpiPolicy:
@@ -697,6 +737,7 @@ class OpenpiPolicy:
 
     def __init__(
         self,
+        logger,
         policy_server_host: str = "127.0.0.1",
         policy_server_port: int | None = 8000,
         policy_server_api_key: Optional[str] = None,
@@ -706,6 +747,7 @@ class OpenpiPolicy:
         upsample_hz: int = 50,
         upsample_method: str = UPSAMPLE_METHOD_SPLINE,
     ):
+        self.logger = logger
         self.policy = WebsocketClientPolicy(
             host=policy_server_host,
             port=policy_server_port,
@@ -713,9 +755,9 @@ class OpenpiPolicy:
         )
         try:
             metadata = self.policy.get_server_metadata()
-            rospy.loginfo("Connected to policy server. metadata=%s", metadata)
+            _loginfo(self.logger, "Connected to policy server. metadata=%s", metadata)
         except Exception as e:
-            rospy.logwarn("Failed to read policy server metadata: %s", e)
+            _logwarn(self.logger, "Failed to read policy server metadata: %s", e)
 
         self.adopted_action_chunks: int = adopted_action_chunks
         self.action_hz: int = action_hz
@@ -723,7 +765,7 @@ class OpenpiPolicy:
         self.upsample_hz: int = upsample_hz
         self.upsample_method: str = str(upsample_method)
         if self.upsample_method not in UPSAMPLE_METHODS:
-            rospy.logwarn(
+            _logwarn(self.logger, 
                 "Unknown upsample_method '%s'. Falling back to '%s'. Available: %s",
                 self.upsample_method,
                 UPSAMPLE_METHOD_SPLINE,
@@ -757,11 +799,11 @@ class OpenpiPolicy:
         lat = _summarize(self._infer_latencies_s)
 
         if lat is None:
-            rospy.loginfo("Inference stats: no inference calls recorded.")
+            _loginfo(self.logger, "Inference stats: no inference calls recorded.")
             return
 
         n_lat, mean_lat, var_lat = lat
-        rospy.loginfo(
+        _loginfo(self.logger, 
             "Inference latency (infer() only): n=%d mean=%.1fms var=%.3f(ms^2)",
             n_lat,
             mean_lat * 1e3,
@@ -849,6 +891,7 @@ class OpenpiPolicy:
 class ExecTraceRecorder:
     def __init__(
         self,
+        logger,
         *,
         enabled: bool,
         config_name: str,
@@ -861,6 +904,7 @@ class ExecTraceRecorder:
         self.joint_dim_names = list(joint_dim_names or [])
         self.base_action_names = list(base_action_names or [])
         self.base_dir = str(base_dir)
+        self.logger = logger
 
         self._t: list[float] = []
         self._joint_state: list[np.ndarray] = []
@@ -932,7 +976,7 @@ class ExecTraceRecorder:
         if not self.enabled:
             return
         if len(self._t) == 0:
-            rospy.logwarn("ExecTraceRecorder: no samples to save.")
+            _logwarn(self.logger, "ExecTraceRecorder: no samples to save.")
             return
 
         out_dir = self._output_dir()
@@ -957,7 +1001,7 @@ class ExecTraceRecorder:
             payload["action_original_delta"] = np.stack(self._action_original_delta, axis=0)
 
         np.savez_compressed(npz_path, **payload)
-        rospy.loginfo("Saved exec trace: %s", npz_path)
+        _loginfo(self.logger, "Saved exec trace: %s", npz_path)
 
         try:
             import matplotlib
@@ -965,7 +1009,7 @@ class ExecTraceRecorder:
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
         except Exception as e:
-            rospy.logwarn("ExecTraceRecorder: matplotlib unavailable, skipping plot (%s).", e)
+            _logwarn(self.logger, "ExecTraceRecorder: matplotlib unavailable, skipping plot (%s).", e)
             return
 
         t = np.asarray(self._t, dtype=np.float64)
@@ -1035,35 +1079,40 @@ class ExecTraceRecorder:
         fig.tight_layout()
         fig.savefig(plot_path, dpi=150, format="png")
         plt.close(fig)
-        rospy.loginfo("Saved exec trace plot: %s", plot_path)
+        _loginfo(self.logger, "Saved exec trace plot: %s", plot_path)
 
 
-def main():
+def main(args=None):
     print("Start hsr_policy_client")
 
-    rospy.init_node("hsr_policy_client")
+    rclpy.init(args=args)
+    node = HSRPolicyClientNode()
+    logger = node.get_logger()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
 
-    config_name: str = rospy.get_param("~config_name", "remote_policy")
-    policy_server_host: str = rospy.get_param("~policy_server_host", "127.0.0.1")
-    policy_server_port: int = int(rospy.get_param("~policy_server_port", 8000))
-    policy_server_api_key: Optional[str] = str(rospy.get_param("~policy_server_api_key", ""))
+    config_name: str = str(node.param("config_name"))
+    policy_server_host: str = str(node.param("policy_server_host"))
+    policy_server_port: int = int(node.param("policy_server_port"))
+    policy_server_api_key: Optional[str] = str(node.param("policy_server_api_key"))
     if policy_server_api_key.strip() == "":
         policy_server_api_key = None
-    adopted_action_chunks = rospy.get_param("~adopted_action_chunks", 1)
-    update_freq: int = rospy.get_param("~update_freq", 5)
-    upsample: bool = rospy.get_param("~upsample", False)
-    upsample_hz: int = rospy.get_param("~upsample_hz", 50)
-    upsample_method: str = rospy.get_param("~upsample_method", UPSAMPLE_METHOD_SPLINE)
+    adopted_action_chunks = int(node.param("adopted_action_chunks"))
+    update_freq: int = int(node.param("update_freq"))
+    upsample: bool = _param_to_bool(node.param("upsample"))
+    upsample_hz: int = int(node.param("upsample_hz"))
+    upsample_method: str = str(node.param("upsample_method"))
     execution_freq: int = upsample_hz if upsample else update_freq
 
-    action_smoothing: str = rospy.get_param("~action_smoothing", ACTION_SMOOTHING_NONE)
-    ema_alpha: float = rospy.get_param("~ema_alpha", 0.2)
-    ma_window: int = rospy.get_param("~ma_window", 5)
-    smooth_gripper: bool = rospy.get_param("~smooth_gripper", False)
-    smooth_base: bool = rospy.get_param("~smooth_base", False)
-    test_mode: bool = _param_to_bool(rospy.get_param("~test_mode", True))
+    action_smoothing: str = str(node.param("action_smoothing"))
+    ema_alpha: float = float(node.param("ema_alpha"))
+    ma_window: int = int(node.param("ma_window"))
+    smooth_gripper: bool = _param_to_bool(node.param("smooth_gripper"))
+    smooth_base: bool = _param_to_bool(node.param("smooth_base"))
+    test_mode: bool = _param_to_bool(node.param("test_mode"))
+    gripper_mode: str = str(node.param("gripper_mode"))
 
-    save_exec_trace: bool = rospy.get_param("~save_exec_trace", False)
+    save_exec_trace: bool = _param_to_bool(node.param("save_exec_trace"))
     trace_group_name = _build_trace_group_name(
         config_name=config_name,
         adopted_action_chunks=int(adopted_action_chunks),
@@ -1078,33 +1127,33 @@ def main():
         smooth_base=bool(smooth_base),
     )
 
-    rospy.loginfo("config_name: %s", config_name)
-    rospy.loginfo("policy_server_host: %s", policy_server_host)
-    rospy.loginfo("policy_server_port: %s", policy_server_port)
-    rospy.loginfo("policy_server_api_key set: %s", policy_server_api_key is not None)
-    rospy.loginfo("adopted_action_chunks: %s", adopted_action_chunks)
-    rospy.loginfo("update_freq: %s", update_freq)
-    rospy.loginfo("upsample: %s", upsample)
-    rospy.loginfo("upsample_hz: %s", upsample_hz)
-    rospy.loginfo("upsample_method: %s", upsample_method)
-    rospy.loginfo("action_smoothing: %s", action_smoothing)
-    rospy.loginfo("ema_alpha: %s", ema_alpha)
-    rospy.loginfo("ma_window: %s", ma_window)
-    rospy.loginfo("smooth_gripper: %s", smooth_gripper)
-    rospy.loginfo("smooth_base: %s", smooth_base)
-    rospy.loginfo("test_mode: %s", test_mode)
-    rospy.loginfo("execution_freq: %s", execution_freq)
-    rospy.loginfo("gripper_mode: %s", rospy.get_param("~gripper_mode", "continuous"))
-    rospy.loginfo("save_exec_trace: %s", save_exec_trace)
-    rospy.loginfo("exec_trace_group_name: %s", trace_group_name)
+    _loginfo(logger, "config_name: %s", config_name)
+    _loginfo(logger, "policy_server_host: %s", policy_server_host)
+    _loginfo(logger, "policy_server_port: %s", policy_server_port)
+    _loginfo(logger, "policy_server_api_key set: %s", policy_server_api_key is not None)
+    _loginfo(logger, "adopted_action_chunks: %s", adopted_action_chunks)
+    _loginfo(logger, "update_freq: %s", update_freq)
+    _loginfo(logger, "upsample: %s", upsample)
+    _loginfo(logger, "upsample_hz: %s", upsample_hz)
+    _loginfo(logger, "upsample_method: %s", upsample_method)
+    _loginfo(logger, "action_smoothing: %s", action_smoothing)
+    _loginfo(logger, "ema_alpha: %s", ema_alpha)
+    _loginfo(logger, "ma_window: %s", ma_window)
+    _loginfo(logger, "smooth_gripper: %s", smooth_gripper)
+    _loginfo(logger, "smooth_base: %s", smooth_base)
+    _loginfo(logger, "test_mode: %s", test_mode)
+    _loginfo(logger, "execution_freq: %s", execution_freq)
+    _loginfo(logger, "gripper_mode: %s", gripper_mode)
+    _loginfo(logger, "save_exec_trace: %s", save_exec_trace)
+    _loginfo(logger, "exec_trace_group_name: %s", trace_group_name)
 
     if test_mode:
-        env = SyntheticReplayEnv(
-            update_freq=execution_freq,
-        )
+        env = SyntheticReplayEnv(node, update_freq=execution_freq)
     else:
-        env = HSREnv(update_freq=execution_freq)
+        env = HSREnv(node, update_freq=execution_freq)
+
     policy = OpenpiPolicy(
+        logger=logger,
         policy_server_host=policy_server_host,
         policy_server_port=policy_server_port,
         policy_server_api_key=policy_server_api_key,
@@ -1114,26 +1163,26 @@ def main():
         upsample_hz=upsample_hz,
         upsample_method=upsample_method,
     )
-    # Default smoothing dims: arm(5) + head(2). Optionally add gripper/base.
+
     base_mask = np.array([True, True, True, True, True, False, True, True, False, False, False], dtype=bool)
     if smooth_gripper:
         base_mask[5] = True
     if smooth_base:
         base_mask[8:11] = True
     action_smoother = ActionSmoother(
+        logger=logger,
         method=action_smoothing,
         ema_alpha=ema_alpha,
         ma_window=ma_window,
         dims_mask=base_mask,
     )
     recorder = ExecTraceRecorder(
+        logger=logger,
         enabled=save_exec_trace,
         config_name=trace_group_name,
         joint_dim_names=env.joint_state_names,
         base_action_names=env.base_action_names,
     )
-    rospy.on_shutdown(recorder.save_and_plot)
-    rospy.on_shutdown(policy.log_inference_stats)
 
     log_interval = 1
     if upsample and update_freq > 0:
@@ -1145,18 +1194,22 @@ def main():
 
     def log_chunk_gap_stats() -> None:
         if not chunk_gaps_s:
-            rospy.loginfo("Chunk gap stats: no chunk gaps recorded.")
+            _loginfo(logger, "Chunk gap stats: no chunk gaps recorded.")
             return
         arr = np.asarray(chunk_gaps_s, dtype=np.float64)
-        rospy.loginfo(
+        _loginfo(
+            logger,
             "Chunk gap (prev chunk last action -> next chunk first action): n=%d mean=%.1fms var=%.3f(ms^2)",
             int(arr.size),
             float(arr.mean()) * 1e3,
             float(arr.var()) * 1e6,
         )
 
+    executor_thread = threading.Thread(target=executor.spin, daemon=True)
+    executor_thread.start()
+
     try:
-        while not rospy.is_shutdown():
+        while rclpy.ok():
             will_infer = len(policy.action_queue) == 0
             obs = env.get_observations()
             if obs is None:
@@ -1164,13 +1217,13 @@ def main():
                 if can_continue_chunk:
                     obs = {"joint_state": env.joint_state, "instruction": env.instruction}
                 else:
-                    rospy.loginfo("Observations are not ready.")
+                    _loginfo(logger, "Observations are not ready.")
                     tick += 1
                     env.sleep()
                     continue
 
             action = policy.act(obs)
-            action_t_s = time.perf_counter() - perf0  # immediately after act()
+            action_t_s = time.perf_counter() - perf0
             action_to_send = action_smoother.update(action)
             is_executed = env.execute_actions(action_to_send)
             sent_t_s = time.perf_counter() - perf0
@@ -1183,7 +1236,6 @@ def main():
                         if gap >= 0:
                             chunk_gaps_s.append(gap)
 
-                # If we just consumed the last action of the current chunk, record chunk end time.
                 if (not will_infer) and len(policy.action_queue) == 0:
                     last_chunk_end_t_s = sent_t_s
 
@@ -1202,19 +1254,14 @@ def main():
                             action_hz=update_freq,
                         )
 
-            # # Debug: dump test images.
-            # cv2.imwrite("/root/catkin_ws/head_rgb.png", obs["head_rgb"])
-            # cv2.imwrite("/root/catkin_ws/hand_rgb.png", obs["hand_rgb"])
-            # # cv2.imshow("hand_rgb", obs["hand_rgb"])
-            # break
-
             if tick % log_interval == 0:
                 if is_executed:
-                    rospy.loginfo("Action executed.")
+                    _loginfo(logger, "Action executed.")
                 else:
-                    rospy.loginfo("Action not executed.")
-                rospy.loginfo("Language instruction: %s", obs.get("instruction", ""))
-                rospy.loginfo("Action: %s", action)
+                    _loginfo(logger, "Action not executed.")
+                _loginfo(logger, "Language instruction: %s", obs.get("instruction", ""))
+                _loginfo(logger, "Action: %s", action)
+
             if not test_mode:
                 if not upsample:
                     env.reset_observation()
@@ -1223,16 +1270,24 @@ def main():
             tick += 1
             env.sleep()
     except KeyboardInterrupt:
-        # Ensure recorder flush even if ROS shutdown hook doesn't run in time.
-        rospy.loginfo("KeyboardInterrupt received. Saving exec trace and shutting down.")
-        recorder.save_and_plot()
-        policy.log_inference_stats()
-        log_chunk_gap_stats()
+        _loginfo(logger, "KeyboardInterrupt received. Saving exec trace and shutting down.")
+    finally:
         try:
-            rospy.signal_shutdown("KeyboardInterrupt")
-        except Exception:
-            pass
-        return
+            recorder.save_and_plot()
+        except Exception as e:
+            _logwarn(logger, "Failed to save execution trace: %s", e)
+        try:
+            policy.log_inference_stats()
+        except Exception as e:
+            _logwarn(logger, "Failed to log inference stats: %s", e)
+        try:
+            log_chunk_gap_stats()
+        except Exception as e:
+            _logwarn(logger, "Failed to log chunk gap stats: %s", e)
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
+        executor_thread.join(timeout=1.0)
 
 
 if __name__ == "__main__":

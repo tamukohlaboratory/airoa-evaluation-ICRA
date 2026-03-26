@@ -1,0 +1,8 @@
+float64 effort # The command effort
+bool do_control_stop # Whether stop apply_force action after setSucceeded
+---
+float64 effort # The current effort exerted
+bool stalled # True if the gripper is stalled
+---
+float64 effort # The current effort exerted
+bool stalled # True if the gripper is stalled
