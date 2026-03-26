@@ -545,11 +545,11 @@ class HSREnv:
         self.head_action_names: list[str] = ["head_pan_joint", "head_tilt_joint"]
         self.base_action_names: list[str] = ["base_x", "base_y", "base_theta"]
 
-        self.arm_pub = self.node.create_publisher(JointTrajectory, "/hsrb/arm_trajectory_controller/command", 1)
-        self.head_pub = self.node.create_publisher(JointTrajectory, "/hsrb/head_trajectory_controller/command", 1)
-        self.gripper_pub = self.node.create_publisher(JointTrajectory, "/hsrb/gripper_controller/command", 1)
-        self.base_pub = self.node.create_publisher(Twist, "/hsrb/command_velocity", 1)
-        self.gripper_close_client = ActionClient(self.node, GripperApplyEffort, "/hsrb/gripper_controller/grasp")
+        self.arm_pub = self.node.create_publisher(JointTrajectory, "/arm_trajectory_controller/joint_trajectory", 1)
+        self.head_pub = self.node.create_publisher(JointTrajectory, "/head_trajectory_controller/joint_trajectory", 1)
+        self.gripper_pub = self.node.create_publisher(JointTrajectory, "/gripper_controller/joint_trajectory", 1)
+        self.base_pub = self.node.create_publisher(Twist, "/omni_base_controller/cmd_vel", 1)
+        self.gripper_close_client = ActionClient(self.node, GripperApplyEffort, "/gripper_controller/grasp")
         self._latest_gripper_goal_future = None
         self._warned_missing_gripper_server = False
 
@@ -561,25 +561,25 @@ class HSREnv:
 
         self._head_sub = self.node.create_subscription(
             CompressedImage,
-            "/hsrb/head_rgbd_sensor/rgb/image_rect_color/compressed",
+            "/head_rgbd_sensor/color/image_raw/compressed",
             self.head_image_callback,
             qos_profile_sensor_data,
         )
         self._hand_sub = self.node.create_subscription(
             CompressedImage,
-            "/hsrb/hand_camera/image_raw/compressed",
+            "/hand_camera/color/image_rect_raw/compressed",
             self.hand_image_callback,
             qos_profile_sensor_data,
         )
         self._joint_sub = self.node.create_subscription(
             JointState,
-            "/hsrb/joint_states",
+            "/joint_states",
             self.joint_state_callback,
             qos_profile_sensor_data,
         )
         self._gripper_open_sub = self.node.create_subscription(
             JointTrajectory,
-            "/hsrb/gripper_controller/command",
+            "/gripper_controller/joint_trajectory",
             self.gripper_open_callback,
             1,
         )
@@ -645,7 +645,7 @@ class HSREnv:
         goal.do_control_stop = False
         if not self.gripper_close_client.wait_for_server(timeout_sec=0.0):
             if not self._warned_missing_gripper_server:
-                _logwarn(self.node.get_logger(), "Gripper action server is not available: /hsrb/gripper_controller/grasp")
+                _logwarn(self.node.get_logger(), "Gripper action server is not available: /gripper_controller/grasp")
                 self._warned_missing_gripper_server = True
             return
         self._latest_gripper_goal_future = self.gripper_close_client.send_goal_async(goal)
