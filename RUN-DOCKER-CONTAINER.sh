@@ -64,6 +64,7 @@ print_env_summary() {
   echo "[INFO] CYCLONEDDS_URI=${CYCLONEDDS_URI:-}"
   echo "[INFO] POLICY_CHECKPOINT_PATH=${POLICY_CHECKPOINT_PATH:-}"
   echo "[INFO] POLICY_CACHE_DIR=${POLICY_CACHE_DIR:-}"
+  echo "[INFO] POLICY_CONFIG_NAME=${POLICY_CONFIG_NAME:-pi0_hsr_airoa-moma}"
   echo "[INFO] HF_CACHE_DIR=${HF_CACHE_DIR:-}"
   echo "[INFO] ROSBAG_DIR=${ROSBAG_DIR:-}"
   echo "[INFO] POLICY_SERVER_HOST=${POLICY_SERVER_HOST:-127.0.0.1}"
@@ -224,15 +225,25 @@ cmd_launch() {
 cmd_down() {
   local policy_container="${POLICY_SERVER_CONTAINER_NAME:-airoa_policy_server}"
   local client_container="${HSR_CLIENT_CONTAINER_NAME:-airoa_hsr_client}"
+  local generated_cyclonedds_host_path="/tmp/cyclonedds-${USER:-user}.xml"
+  local cyclonedds_container_path="/tmp/cyclonedds.xml"
   local found=false
 
   for container in "${client_container}" "${policy_container}"; do
     if docker ps -a --format '{{.Names}}' | grep -qx "${container}"; then
       found=true
+      if [[ "${container}" == "${client_container}" ]]; then
+        docker exec "${container}" rm -f "${cyclonedds_container_path}" >/dev/null 2>&1 || true
+      fi
       echo "[INFO] Removing container: ${container}"
       docker rm -f "${container}" >/dev/null
     fi
   done
+
+  if [[ -f "${generated_cyclonedds_host_path}" ]]; then
+    rm -f "${generated_cyclonedds_host_path}"
+    echo "[INFO] Removed temporary CycloneDDS config: ${generated_cyclonedds_host_path}"
+  fi
 
   if [[ "${found}" == "false" ]]; then
     echo "[INFO] No managed containers found."
