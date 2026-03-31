@@ -2,6 +2,8 @@
 
 ROS 2 deployment guide for the HSR policy client.
 
+For a short Japanese ops memo focused on the split inference-PC / control-PC workflow, see `deploy/REAL_ROBOT_WORKFLOW_JA.md`.
+
 ## 1. Host prerequisites
 
 - Linux
@@ -41,6 +43,7 @@ export ROSBAG_DIR=$PWD/datasets/rosbags
 ```bash
 export ROS_DOMAIN_ID=0
 export ROS_LOCALHOST_ONLY=0
+export RMW_IMPLEMENTATION=
 ```
 
 ## 4. Optional policy-specific variables
@@ -62,6 +65,42 @@ export POLICY_PYTORCH_DEVICE=cuda
 ./RUN-DOCKER-CONTAINER.sh up
 ./RUN-DOCKER-CONTAINER.sh logs policy_server
 ./RUN-DOCKER-CONTAINER.sh logs hsr_client
+```
+
+For split deployment across two hosts:
+
+- Inference PC: run only `policy_server`
+
+```bash
+export POLICY_CHECKPOINT_PATH=/abs/path/to/checkpoint_dir
+export POLICY_SERVER_PORT=8000
+./RUN-DOCKER-CONTAINER.sh up-server
+```
+
+- Control PC: run only `hsr_client`, pointing `POLICY_SERVER_HOST` at the inference PC
+
+```bash
+export TEST_MODE=false
+export ROS_DOMAIN_ID=<robot_domain_id>
+export ROS_LOCALHOST_ONLY=0
+export POLICY_SERVER_HOST=<inference_pc_ip>
+export POLICY_SERVER_PORT=8000
+./RUN-DOCKER-CONTAINER.sh up-client
+```
+
+If CycloneDDS on the control PC interferes with DDS discovery when `hsr_client` runs in Docker,
+prefer running the client directly on the host instead of in the container:
+
+```bash
+export TEST_MODE=false
+export ROS_DOMAIN_ID=<robot_domain_id>
+export ROS_LOCALHOST_ONLY=0
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export CYCLONEDDS_URI=file:///abs/path/to/cyclonedds.xml
+export POLICY_SERVER_HOST=<inference_pc_ip>
+export POLICY_SERVER_PORT=8000
+./RUN-HOST-CLIENT.sh setup
+./RUN-HOST-CLIENT.sh launch
 ```
 
 ## 6. Run deploy launch

@@ -15,8 +15,12 @@ from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSDurabilityPolicy
+from rclpy.qos import QoSHistoryPolicy
+from rclpy.qos import QoSProfile
+from rclpy.qos import QoSReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import Image
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectory
@@ -394,6 +398,8 @@ class HSRPolicyClientNode(Node):
         ("smooth_gripper", False),
         ("smooth_base", False),
         ("gripper_mode", "continuous"),
+        ("require_control_mode", False),
+        ("expected_control_mode", "auto"),
         ("test_mode", True),
         ("save_exec_trace", False),
     ]
@@ -522,7 +528,17 @@ class HSREnv:
         self.gripper_state = 0
         self.control_mode: Optional[str] = None
         self.gripper_mode = str(self.node.param("gripper_mode"))
+        self.require_control_mode = _param_to_bool(self.node.param("require_control_mode"))
+        self.expected_control_mode = str(self.node.param("expected_control_mode"))
         self.instruction = str(self.node.param("instruction"))
+        self._control_mode_received = False
+        self._last_missing_obs_log_t = 0.0
+        self._last_missing_joint_log_t = 0.0
+        self._last_control_mode_log_t = 0.0
+        self._last_image_decode_log_t = 0.0
+        self._logged_head_ready = False
+        self._logged_hand_ready = False
+        self._logged_joint_ready = False
 
         self.joint_state_names: list[str] = [
             "arm_lift_joint",
@@ -545,6 +561,19 @@ class HSREnv:
         self.head_action_names: list[str] = ["head_pan_joint", "head_tilt_joint"]
         self.base_action_names: list[str] = ["base_x", "base_y", "base_theta"]
 
+        reliable_sensor_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        reliable_joint_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+
         self.arm_pub = self.node.create_publisher(JointTrajectory, "/arm_trajectory_controller/joint_trajectory", 1)
         self.head_pub = self.node.create_publisher(JointTrajectory, "/head_trajectory_controller/joint_trajectory", 1)
         self.gripper_pub = self.node.create_publisher(JointTrajectory, "/gripper_controller/joint_trajectory", 1)
@@ -563,19 +592,37 @@ class HSREnv:
             CompressedImage,
             "/head_rgbd_sensor/color/image_raw/compressed",
             self.head_image_callback,
-            qos_profile_sensor_data,
+            reliable_sensor_qos,
+        )
+        self._head_raw_sub = self.node.create_subscription(
+            Image,
+            "/head_rgbd_sensor/color/image_raw",
+            self.head_image_raw_callback,
+            reliable_sensor_qos,
         )
         self._hand_sub = self.node.create_subscription(
             CompressedImage,
             "/hand_camera/color/image_rect_raw/compressed",
             self.hand_image_callback,
-            qos_profile_sensor_data,
+            reliable_sensor_qos,
+        )
+        self._hand_raw_sub = self.node.create_subscription(
+            Image,
+            "/hand_camera/color/image_rect_raw",
+            self.hand_image_raw_callback,
+            reliable_sensor_qos,
         )
         self._joint_sub = self.node.create_subscription(
             JointState,
             "/joint_states",
             self.joint_state_callback,
-            qos_profile_sensor_data,
+            reliable_joint_qos,
+        )
+        self._whole_body_joint_sub = self.node.create_subscription(
+            JointState,
+            "/whole_body/joint_states",
+            self.whole_body_joint_state_callback,
+            reliable_joint_qos,
         )
         self._gripper_open_sub = self.node.create_subscription(
             JointTrajectory,
@@ -592,21 +639,113 @@ class HSREnv:
 
     def head_image_callback(self, msg: CompressedImage):
         np_arr = np.frombuffer(msg.data, np.uint8)
-        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)[:, :, :]
-        self.head_rgb = np.array(image)
+        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if image is None:
+            self._log_image_decode_failure("/head_rgbd_sensor/color/image_raw/compressed", "cv2.imdecode returned None")
+            return
+        self.head_rgb = np.array(image[:, :, :])
+        if not self._logged_head_ready:
+            _loginfo(self.node.get_logger(), "Received head image from compressed topic. shape=%s", str(self.head_rgb.shape))
+            self._logged_head_ready = True
+
+    def head_image_raw_callback(self, msg: Image):
+        image = self._decode_raw_image(msg)
+        if image is not None:
+            self.head_rgb = image
+            if not self._logged_head_ready:
+                _loginfo(self.node.get_logger(), "Received head image from raw topic. shape=%s", str(self.head_rgb.shape))
+                self._logged_head_ready = True
 
     def hand_image_callback(self, msg: CompressedImage):
         np_arr = np.frombuffer(msg.data, np.uint8)
-        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)[:, :, :]
-        self.hand_rgb = np.array(image)
+        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if image is None:
+            self._log_image_decode_failure("/hand_camera/color/image_rect_raw/compressed", "cv2.imdecode returned None")
+            return
+        self.hand_rgb = np.array(image[:, :, :])
+        if not self._logged_hand_ready:
+            _loginfo(self.node.get_logger(), "Received hand image from compressed topic. shape=%s", str(self.hand_rgb.shape))
+            self._logged_hand_ready = True
+
+    def hand_image_raw_callback(self, msg: Image):
+        image = self._decode_raw_image(msg)
+        if image is not None:
+            self.hand_rgb = image
+            if not self._logged_hand_ready:
+                _loginfo(self.node.get_logger(), "Received hand image from raw topic. shape=%s", str(self.hand_rgb.shape))
+                self._logged_hand_ready = True
+
+    def _log_image_decode_failure(self, topic_name: str, reason: str) -> None:
+        now = time.monotonic()
+        if now - self._last_image_decode_log_t >= 2.0:
+            _logwarn(self.node.get_logger(), "Failed to decode image from %s: %s", topic_name, reason)
+            self._last_image_decode_log_t = now
+
+    def _decode_raw_image(self, msg: Image) -> Optional[np.ndarray]:
+        encoding = str(msg.encoding).lower()
+        channels_map = {
+            "rgb8": 3,
+            "bgr8": 3,
+            "rgba8": 4,
+            "bgra8": 4,
+            "mono8": 1,
+        }
+        channels = channels_map.get(encoding)
+        if channels is None:
+            _logwarn(self.node.get_logger(), "Unsupported image encoding on raw topic: %s", msg.encoding)
+            return None
+
+        data = np.frombuffer(msg.data, dtype=np.uint8)
+        expected = int(msg.height) * int(msg.step)
+        if data.size < expected:
+            _logwarn(
+                self.node.get_logger(),
+                "Raw image payload too small: encoding=%s size=%d expected>=%d",
+                msg.encoding,
+                int(data.size),
+                int(expected),
+            )
+            return None
+
+        image = data[:expected].reshape(int(msg.height), int(msg.step))
+        image = image[:, : int(msg.width) * channels].reshape(int(msg.height), int(msg.width), channels)
+
+        if encoding == "rgb8":
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        elif encoding == "rgba8":
+            image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
+        elif encoding == "bgra8":
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        elif encoding == "mono8":
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+        return np.array(image)
 
     def joint_state_callback(self, msg: JointState):
+        self._update_joint_state(msg, "/joint_states")
+
+    def whole_body_joint_state_callback(self, msg: JointState):
+        self._update_joint_state(msg, "/whole_body/joint_states")
+
+    def _update_joint_state(self, msg: JointState, topic_name: str):
         name_to_index = {name: idx for idx, name in enumerate(msg.name)}
-        try:
-            joints = [msg.position[name_to_index[name]] for name in self.joint_state_names]
-        except KeyError:
+        missing = [name for name in self.joint_state_names if name not in name_to_index]
+        if missing:
+            now = time.monotonic()
+            if now - self._last_missing_joint_log_t >= 2.0:
+                _logwarn(
+                    self.node.get_logger(),
+                    "JointState on %s is missing required joints: %s",
+                    topic_name,
+                    ", ".join(missing),
+                )
+                self._last_missing_joint_log_t = now
             return
+        joints = [msg.position[name_to_index[name]] for name in self.joint_state_names]
         self.joint_state = np.asarray(joints, dtype=np.float32)
+        if not self._logged_joint_ready:
+            _loginfo(self.node.get_logger(), "Received joint state from %s.", topic_name)
+            self._logged_joint_ready = True
 
     def gripper_open_callback(self, msg: JointTrajectory):
         _ = msg
@@ -614,6 +753,7 @@ class HSREnv:
 
     def control_mode_callback(self, msg: String):
         self.control_mode = msg.data
+        self._control_mode_received = True
 
     def update_instruction_srv(self, request: StringTrigger.Request, response: StringTrigger.Response):
         self.instruction = request.message
@@ -628,7 +768,23 @@ class HSREnv:
             self.joint_state = None
 
     def get_observations(self):
-        if self.head_rgb is None or self.hand_rgb is None or self.joint_state is None:
+        missing: list[str] = []
+        if self.head_rgb is None:
+            missing.append("head_rgb")
+        if self.hand_rgb is None:
+            missing.append("hand_rgb")
+        if self.joint_state is None:
+            missing.append("joint_state")
+        if missing:
+            now = time.monotonic()
+            if now - self._last_missing_obs_log_t >= 2.0:
+                _logwarn(
+                    self.node.get_logger(),
+                    "Waiting for observations. missing=%s control_mode=%s",
+                    ", ".join(missing),
+                    str(self.control_mode),
+                )
+                self._last_missing_obs_log_t = now
             return None
         return {
             "head_rgb": self.head_rgb,
@@ -652,8 +808,36 @@ class HSREnv:
         self._warned_missing_gripper_server = False
 
     def execute_actions(self, action: np.ndarray) -> bool:
-        if self.control_mode != "auto":
+        if self._control_mode_received:
+            if self.control_mode != self.expected_control_mode:
+                now = time.monotonic()
+                if now - self._last_control_mode_log_t >= 2.0:
+                    _logwarn(
+                        self.node.get_logger(),
+                        "Action blocked because control_mode is '%s' (expected '%s').",
+                        str(self.control_mode),
+                        self.expected_control_mode,
+                    )
+                    self._last_control_mode_log_t = now
+                return False
+        elif self.require_control_mode:
+            now = time.monotonic()
+            if now - self._last_control_mode_log_t >= 2.0:
+                _logwarn(
+                    self.node.get_logger(),
+                    "Action blocked because control_mode is unavailable (expected '%s').",
+                    self.expected_control_mode,
+                )
+                self._last_control_mode_log_t = now
             return False
+        else:
+            now = time.monotonic()
+            if now - self._last_control_mode_log_t >= 5.0:
+                _logwarn(
+                    self.node.get_logger(),
+                    "control_mode topic is unavailable. Allowing actions because require_control_mode=false.",
+                )
+                self._last_control_mode_log_t = now
 
         action = np.asarray(action, dtype=np.float32).reshape(-1)
 
@@ -1109,6 +1293,8 @@ def main(args=None):
     ma_window: int = int(node.param("ma_window"))
     smooth_gripper: bool = _param_to_bool(node.param("smooth_gripper"))
     smooth_base: bool = _param_to_bool(node.param("smooth_base"))
+    require_control_mode: bool = _param_to_bool(node.param("require_control_mode"))
+    expected_control_mode: str = str(node.param("expected_control_mode"))
     test_mode: bool = _param_to_bool(node.param("test_mode"))
     gripper_mode: str = str(node.param("gripper_mode"))
 
@@ -1141,6 +1327,8 @@ def main(args=None):
     _loginfo(logger, "ma_window: %s", ma_window)
     _loginfo(logger, "smooth_gripper: %s", smooth_gripper)
     _loginfo(logger, "smooth_base: %s", smooth_base)
+    _loginfo(logger, "require_control_mode: %s", require_control_mode)
+    _loginfo(logger, "expected_control_mode: %s", expected_control_mode)
     _loginfo(logger, "test_mode: %s", test_mode)
     _loginfo(logger, "execution_freq: %s", execution_freq)
     _loginfo(logger, "gripper_mode: %s", gripper_mode)
@@ -1286,7 +1474,11 @@ def main(args=None):
             _logwarn(logger, "Failed to log chunk gap stats: %s", e)
         executor.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception as e:
+            _logwarn(logger, "Ignoring shutdown error: %s", e)
         executor_thread.join(timeout=1.0)
 
 
