@@ -32,6 +32,34 @@ server はこの config から `action_mode` を metadata として配信し，c
 cd ~/usr/watanabe_ws/icra_compe/src/airoa-evaluation-ICRA
 
 export TEST_MODE=false
+export ROS_DOMAIN_ID=55
+export ROS_LOCALHOST_ONLY=0
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export CYCLONEDDS_URI=file:///home/hma/cyclonedds.xml
+unset CYCLONEDDS_INTERFACE
+export CYCLONEDDS_INTERFACE_ADDRESS=192.168.11.5
+export CYCLONEDDS_PEERS=192.168.11.55
+# 魔改造HSRのIPアドレス
+
+export POLICY_SERVER_HOST=172.30.21.216
+# 推論PCのIPアドレス
+
+export POLICY_SERVER_PORT=8000
+
+# for C055
+export TEST_MODE=false
+export ROS_DOMAIN_ID=55
+export ROS_LOCALHOST_ONLY=0
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export CYCLONEDDS_URI=file:///home/hma/cyclonedds.xml
+unset CYCLONEDDS_INTERFACE
+export CYCLONEDDS_INTERFACE_ADDRESS=192.168.11.5
+export CYCLONEDDS_PEERS=192.168.11.55
+export POLICY_SERVER_HOST=172.30.21.216
+export POLICY_SERVER_PORT=8000
+
+# for 魔改造
+export TEST_MODE=false
 export ROS_DOMAIN_ID=74
 export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
@@ -39,11 +67,7 @@ export CYCLONEDDS_URI=file:///home/hma/cyclonedds.xml
 unset CYCLONEDDS_INTERFACE
 export CYCLONEDDS_INTERFACE_ADDRESS=192.168.10.6
 export CYCLONEDDS_PEERS=192.168.10.50
-# 魔改造HSRのIPアドレス
-
 export POLICY_SERVER_HOST=172.30.21.216
-# 推論PCのIPアドレス
-
 export POLICY_SERVER_PORT=8000
 ```
 
@@ -62,7 +86,12 @@ export POLICY_SERVER_PORT=8000
 ```bash
 ros2 launch hsr_policy_client hsr_policy_client.launch.py \
   test_mode:=false \
-  instruction:='Pick up the red cup on the table'
+  instruction:='Pick up an object'
+
+relocat
+ros2 launch hsr_policy_client hsr_policy_client.launch.py \
+  test_mode:=false \
+  instruction:='From a rectangle by relocating the mug that is not at a rectangle corner 3'
 ```
 
 今の launch default は保守寄りです．

@@ -688,25 +688,25 @@ class HSREnv:
 
         self._head_sub = self.node.create_subscription(
             CompressedImage,
-            "/head_rgbd_sensor/color/image_raw/compressed",
+            "/head_rgbd_sensor/rgb/image_raw/compressed",
             self.head_image_callback,
             reliable_sensor_qos,
         )
         self._head_raw_sub = self.node.create_subscription(
             Image,
-            "/head_rgbd_sensor/color/image_raw",
+            "/head_rgbd_sensor/rgb/image_rect_color",
             self.head_image_raw_callback,
             reliable_sensor_qos,
         )
         self._hand_sub = self.node.create_subscription(
             CompressedImage,
-            "/hand_camera/color/image_rect_raw/compressed",
+            "/hand_camera/image_raw/compressed",
             self.hand_image_callback,
             reliable_sensor_qos,
         )
         self._hand_raw_sub = self.node.create_subscription(
             Image,
-            "/hand_camera/color/image_rect_raw",
+            "/hand_camera/image_raw",
             self.hand_image_raw_callback,
             reliable_sensor_qos,
         )
@@ -781,20 +781,27 @@ class HSREnv:
 
     def _decode_raw_image(self, msg: Image) -> Optional[np.ndarray]:
         encoding = str(msg.encoding).lower()
-        channels_map = {
+        bytes_per_pixel_map = {
             "rgb8": 3,
             "bgr8": 3,
             "rgba8": 4,
             "bgra8": 4,
             "mono8": 1,
+            "yuv422": 2,
+            "yuv422_yuy2": 2,
+            "yuv422_yuyv": 2,
+            "yuyv": 2,
         }
-        channels = channels_map.get(encoding)
-        if channels is None:
+        bytes_per_pixel = bytes_per_pixel_map.get(encoding)
+        if bytes_per_pixel is None:
             _logwarn(self.node.get_logger(), "Unsupported image encoding on raw topic: %s", msg.encoding)
             return None
 
         data = np.frombuffer(msg.data, dtype=np.uint8)
-        expected = int(msg.height) * int(msg.step)
+        height = int(msg.height)
+        width = int(msg.width)
+        step = int(msg.step)
+        expected = height * step
         if data.size < expected:
             _logwarn(
                 self.node.get_logger(),
@@ -805,8 +812,23 @@ class HSREnv:
             )
             return None
 
-        image = data[:expected].reshape(int(msg.height), int(msg.step))
-        image = image[:, : int(msg.width) * channels].reshape(int(msg.height), int(msg.width), channels)
+        used_row_bytes = width * bytes_per_pixel
+        if step < used_row_bytes:
+            _logwarn(
+                self.node.get_logger(),
+                "Raw image step too small: encoding=%s step=%d required>=%d",
+                msg.encoding,
+                step,
+                used_row_bytes,
+            )
+            return None
+
+        image = data[:expected].reshape(height, step)
+        image = image[:, :used_row_bytes]
+        if bytes_per_pixel == 1:
+            image = image.reshape(height, width)
+        else:
+            image = image.reshape(height, width, bytes_per_pixel)
 
         if encoding == "rgb8":
             image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
@@ -816,6 +838,14 @@ class HSREnv:
             image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
         elif encoding == "mono8":
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        elif encoding in {"yuv422", "yuv422_yuy2", "yuv422_yuyv", "yuyv"}:
+            yuy2_code = getattr(cv2, "COLOR_YUV2BGR_YUY2", None)
+            if yuy2_code is None:
+                yuy2_code = getattr(cv2, "COLOR_YUV2BGR_YUYV", None)
+            if yuy2_code is None:
+                _logwarn(self.node.get_logger(), "OpenCV does not support YUY2 conversion on this build.")
+                return None
+            image = cv2.cvtColor(image, yuy2_code)
 
         return np.array(image)
 
