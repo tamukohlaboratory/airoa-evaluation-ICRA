@@ -163,6 +163,29 @@ SYNTH_TEST_IMAGE_HEIGHT = 480
 SYNTH_TEST_IMAGE_WIDTH = 640
 SYNTH_TEST_RANDOM_SEED = 0
 
+CAMERA_TOPICS_BY_HSR_ID: dict[str, dict[str, str]] = {
+    "C055": {
+        "head_compressed": "/head_rgbd_sensor/rgb/image_raw/compressed",
+        "head_raw": "/head_rgbd_sensor/rgb/image_rect_color",
+        "hand_compressed": "/hand_camera/image_raw/compressed",
+        "hand_raw": "/hand_camera/image_raw",
+    },
+    "MHSRC": {
+        "head_compressed": "/head_rgbd_sensor/color/image_raw/compressed",
+        "head_raw": "/head_rgbd_sensor/color/image_raw",
+        "hand_compressed": "/hand_camera/color/image_rect_raw/compressed",
+        "hand_raw": "/hand_camera/color/image_rect_raw",
+    },
+}
+DEFAULT_HSR_ID = "MHSRC"
+
+
+def _resolve_camera_topics_for_hsr(hsr_id: Any) -> tuple[str, dict[str, str]]:
+    normalized = str(hsr_id or "").strip().upper()
+    if normalized in CAMERA_TOPICS_BY_HSR_ID:
+        return normalized, CAMERA_TOPICS_BY_HSR_ID[normalized]
+    return DEFAULT_HSR_ID, CAMERA_TOPICS_BY_HSR_ID[DEFAULT_HSR_ID]
+
 
 def _float_tag(x: float, *, ndigits: int = 3) -> str:
     """Filesystem-friendly float tag, e.g. 0.2 -> 0p200, -1.5 -> m1p500."""
@@ -637,6 +660,31 @@ class HSREnv:
         self._logged_head_ready = False
         self._logged_hand_ready = False
         self._logged_joint_ready = False
+        self.hsr_id = str(os.environ.get("HSR_ID", DEFAULT_HSR_ID)).strip()
+        self._resolved_hsr_id, camera_topics = _resolve_camera_topics_for_hsr(self.hsr_id)
+        self.head_compressed_topic = camera_topics["head_compressed"]
+        self.head_raw_topic = camera_topics["head_raw"]
+        self.hand_compressed_topic = camera_topics["hand_compressed"]
+        self.hand_raw_topic = camera_topics["hand_raw"]
+        if self.hsr_id.upper() != self._resolved_hsr_id:
+            _logwarn(
+                self.node.get_logger(),
+                "Unknown HSR_ID='%s'. Falling back to %s camera topics.",
+                self.hsr_id,
+                self._resolved_hsr_id,
+            )
+        _loginfo(
+            self.node.get_logger(),
+            (
+                "Using camera topics for HSR_ID=%s: "
+                "head(compressed=%s raw=%s) hand(compressed=%s raw=%s)"
+            ),
+            self._resolved_hsr_id,
+            self.head_compressed_topic,
+            self.head_raw_topic,
+            self.hand_compressed_topic,
+            self.hand_raw_topic,
+        )
 
         self.joint_state_names: list[str] = [
             "arm_lift_joint",
@@ -688,25 +736,25 @@ class HSREnv:
 
         self._head_sub = self.node.create_subscription(
             CompressedImage,
-            "/head_rgbd_sensor/rgb/image_raw/compressed",
+            self.head_compressed_topic,
             self.head_image_callback,
             reliable_sensor_qos,
         )
         self._head_raw_sub = self.node.create_subscription(
             Image,
-            "/head_rgbd_sensor/rgb/image_rect_color",
+            self.head_raw_topic,
             self.head_image_raw_callback,
             reliable_sensor_qos,
         )
         self._hand_sub = self.node.create_subscription(
             CompressedImage,
-            "/hand_camera/image_raw/compressed",
+            self.hand_compressed_topic,
             self.hand_image_callback,
             reliable_sensor_qos,
         )
         self._hand_raw_sub = self.node.create_subscription(
             Image,
-            "/hand_camera/image_raw",
+            self.hand_raw_topic,
             self.hand_image_raw_callback,
             reliable_sensor_qos,
         )
@@ -739,7 +787,7 @@ class HSREnv:
         np_arr = np.frombuffer(msg.data, np.uint8)
         image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         if image is None:
-            self._log_image_decode_failure("/head_rgbd_sensor/color/image_raw/compressed", "cv2.imdecode returned None")
+            self._log_image_decode_failure(self.head_compressed_topic, "cv2.imdecode returned None")
             return
         self.head_rgb = np.array(image[:, :, :])
         if not self._logged_head_ready:
@@ -758,7 +806,7 @@ class HSREnv:
         np_arr = np.frombuffer(msg.data, np.uint8)
         image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
         if image is None:
-            self._log_image_decode_failure("/hand_camera/color/image_rect_raw/compressed", "cv2.imdecode returned None")
+            self._log_image_decode_failure(self.hand_compressed_topic, "cv2.imdecode returned None")
             return
         self.hand_rgb = np.array(image[:, :, :])
         if not self._logged_hand_ready:
