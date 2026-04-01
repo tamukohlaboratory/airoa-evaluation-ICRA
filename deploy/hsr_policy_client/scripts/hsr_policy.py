@@ -48,6 +48,103 @@ def _logwarn(logger: Any, msg: str, *args: Any) -> None:
     logger.warning(_fmt_log(msg, *args))
 
 
+ACTION_MODE_AUTO = "auto"
+ACTION_MODE_RELATIVE = "relative"
+ACTION_MODE_ABSOLUTE = "absolute_arm_head_relative_gripper_base"
+ACTION_MODE_STATE_DIFF = "state_diff_arm_head_relative_gripper_base"
+ACTION_MODES = [ACTION_MODE_AUTO, ACTION_MODE_RELATIVE, ACTION_MODE_ABSOLUTE, ACTION_MODE_STATE_DIFF]
+
+
+def _normalize_action_mode(value: Any, *, allow_auto: bool = False) -> Optional[str]:
+    text = str(value or "").strip().lower().replace("-", "_")
+    if text == "":
+        return ACTION_MODE_AUTO if allow_auto else None
+    if allow_auto and text == ACTION_MODE_AUTO:
+        return ACTION_MODE_AUTO
+
+    exact_map = {
+        ACTION_MODE_RELATIVE: ACTION_MODE_RELATIVE,
+        ACTION_MODE_ABSOLUTE: ACTION_MODE_ABSOLUTE,
+        ACTION_MODE_STATE_DIFF: ACTION_MODE_STATE_DIFF,
+        "absolute": ACTION_MODE_ABSOLUTE,
+        "state_diff": ACTION_MODE_STATE_DIFF,
+        "statediff": ACTION_MODE_STATE_DIFF,
+    }
+    if text in exact_map:
+        return exact_map[text]
+
+    if "absolute" in text:
+        return ACTION_MODE_ABSOLUTE
+    if "state_diff" in text or "statediff" in text:
+        return ACTION_MODE_STATE_DIFF
+    if "relative" in text:
+        return ACTION_MODE_RELATIVE
+    return None
+
+
+def _resolve_action_mode(
+    *,
+    requested_action_mode: Any,
+    server_action_mode: Any,
+    server_config_name: Any,
+    fallback_config_name: Any,
+) -> tuple[str, str]:
+    requested = _normalize_action_mode(requested_action_mode, allow_auto=True)
+    server_mode = _normalize_action_mode(server_action_mode)
+    server_cfg_mode = _normalize_action_mode(server_config_name)
+    fallback_mode = _normalize_action_mode(fallback_config_name)
+
+    if requested and requested != ACTION_MODE_AUTO:
+        return requested, "client_parameter"
+    if server_mode:
+        return server_mode, "server_metadata.action_mode"
+    if server_cfg_mode:
+        return server_cfg_mode, "server_metadata.config_name"
+    if fallback_mode:
+        return fallback_mode, "client_config_name"
+    return ACTION_MODE_RELATIVE, "historical_default"
+
+
+def _convert_model_action_to_command(
+    action: np.ndarray,
+    joint_state: np.ndarray,
+    action_mode: str,
+    *,
+    logger: Any | None = None,
+    warn_on_unknown: bool = True,
+) -> np.ndarray:
+    cmd = np.asarray(action, dtype=np.float32).reshape(-1).copy()
+    joint_state = np.asarray(joint_state, dtype=np.float32).reshape(-1)
+    normalized_mode = _normalize_action_mode(action_mode)
+
+    if normalized_mode == ACTION_MODE_ABSOLUTE:
+        return cmd
+
+    if normalized_mode in (ACTION_MODE_RELATIVE, ACTION_MODE_STATE_DIFF):
+        arm_dim = min(5, cmd.shape[0], joint_state.shape[0])
+        if arm_dim > 0:
+            cmd[:arm_dim] += joint_state[:arm_dim]
+        if cmd.shape[0] > 6 and joint_state.shape[0] > 6:
+            head_dim = min(2, cmd.shape[0] - 6, joint_state.shape[0] - 6)
+            if head_dim > 0:
+                cmd[6 : 6 + head_dim] += joint_state[6 : 6 + head_dim]
+        return cmd
+
+    if warn_on_unknown and logger is not None:
+        _logwarn(
+            logger,
+            "Unknown action_mode '%s'. Falling back to relative-style arm/head conversion.",
+            str(action_mode),
+        )
+    return _convert_model_action_to_command(
+        cmd,
+        joint_state,
+        ACTION_MODE_RELATIVE,
+        logger=logger,
+        warn_on_unknown=False,
+    )
+
+
 MODE_CONTINUOUS = "continuous"
 MODE_DISCRETE = "discrete"
 MODE_HYBRID = "hybrid"
@@ -384,6 +481,7 @@ class HSRPolicyClientNode(Node):
     DEFAULT_PARAMETERS = [
         ("instruction", "Grasp the apple."),
         ("config_name", "remote_policy"),
+        ("action_mode", ACTION_MODE_AUTO),
         ("policy_server_host", "127.0.0.1"),
         ("policy_server_port", 8000),
         ("policy_server_api_key", ""),
@@ -960,8 +1058,29 @@ class OpenpiPolicy:
         upsample: bool = False,
         upsample_hz: int = 50,
         upsample_method: str = UPSAMPLE_METHOD_SPLINE,
+        action_mode: str = ACTION_MODE_AUTO,
+        fallback_config_name: Optional[str] = None,
     ):
         self.logger = logger
+        self.requested_action_mode = action_mode
+        self.fallback_config_name = fallback_config_name
+        self.server_metadata: dict[str, Any] = {}
+        self.server_config_name: Optional[str] = None
+        self.action_mode_resolution_source: str = ""
+        self.action_mode: str = ACTION_MODE_RELATIVE
+
+        normalized_requested_action_mode = _normalize_action_mode(action_mode, allow_auto=True)
+        if normalized_requested_action_mode is None:
+            _logwarn(
+                self.logger,
+                "Unknown requested action_mode '%s'. Falling back to '%s'. Available: %s",
+                str(action_mode),
+                ACTION_MODE_AUTO,
+                ", ".join(ACTION_MODES),
+            )
+            normalized_requested_action_mode = ACTION_MODE_AUTO
+        self.requested_action_mode = normalized_requested_action_mode
+
         self.policy = WebsocketClientPolicy(
             host=policy_server_host,
             port=policy_server_port,
@@ -969,9 +1088,57 @@ class OpenpiPolicy:
         )
         try:
             metadata = self.policy.get_server_metadata()
+            self.server_metadata = dict(metadata)
+            self.server_config_name = metadata.get("config_name")
             _loginfo(self.logger, "Connected to policy server. metadata=%s", metadata)
         except Exception as e:
             _logwarn(self.logger, "Failed to read policy server metadata: %s", e)
+
+        self.action_mode, self.action_mode_resolution_source = _resolve_action_mode(
+            requested_action_mode=self.requested_action_mode,
+            server_action_mode=self.server_metadata.get("action_mode"),
+            server_config_name=self.server_metadata.get("config_name"),
+            fallback_config_name=self.fallback_config_name,
+        )
+        _loginfo(
+            self.logger,
+            "Resolved action_mode=%s (source=%s, requested=%s, server_config=%s, client_config=%s)",
+            self.action_mode,
+            self.action_mode_resolution_source,
+            self.requested_action_mode,
+            str(self.server_config_name),
+            str(self.fallback_config_name),
+        )
+
+        if self.requested_action_mode != ACTION_MODE_AUTO:
+            server_action_mode = _normalize_action_mode(self.server_metadata.get("action_mode"))
+            if server_action_mode is not None and server_action_mode != self.requested_action_mode:
+                _logwarn(
+                    self.logger,
+                    "Requested action_mode '%s' overrides server action_mode '%s'. Ensure this is intentional.",
+                    self.requested_action_mode,
+                    server_action_mode,
+                )
+
+        if (
+            self.server_config_name
+            and self.fallback_config_name
+            and self.server_config_name != self.fallback_config_name
+        ):
+            if self.fallback_config_name not in {"remote_policy", "remote"}:
+                _logwarn(
+                    self.logger,
+                    "Client config_name '%s' differs from server config_name '%s'. The runtime uses server metadata for action conversion; the client config_name mainly affects local trace naming.",
+                    self.fallback_config_name,
+                    self.server_config_name,
+                )
+            else:
+                _loginfo(
+                    self.logger,
+                    "Server config_name is '%s' while client trace config_name is '%s'.",
+                    self.server_config_name,
+                    self.fallback_config_name,
+                )
 
         self.adopted_action_chunks: int = adopted_action_chunks
         self.action_hz: int = action_hz
@@ -979,7 +1146,8 @@ class OpenpiPolicy:
         self.upsample_hz: int = upsample_hz
         self.upsample_method: str = str(upsample_method)
         if self.upsample_method not in UPSAMPLE_METHODS:
-            _logwarn(self.logger, 
+            _logwarn(
+                self.logger,
                 "Unknown upsample_method '%s'. Falling back to '%s'. Available: %s",
                 self.upsample_method,
                 UPSAMPLE_METHOD_SPLINE,
@@ -1054,10 +1222,12 @@ class OpenpiPolicy:
 
         if len(self.action_queue) > 0:
             action = self.action_queue.popleft()
-            # Convert delta-style arm/head outputs back to absolute values.
-            return action + np.concatenate(
-                [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
-            )  # Gripper/base dimensions are not delta-form, so add zeros there.
+            return _convert_model_action_to_command(
+                action,
+                obs["joint_state"],
+                self.action_mode,
+                logger=self.logger,
+            )
         # Build input dictionary for policy inference.
         policy_input = {
             "head_rgb": obs["head_rgb"],
@@ -1093,10 +1263,12 @@ class OpenpiPolicy:
         self.action_queue.extend(action_chunk[1:])
         action = action_chunk[0]  # Return only the first action now; queue the rest.
 
-        # Convert delta-style arm/head outputs back to absolute values.
-        return action + np.concatenate(
-            [obs["joint_state"][:5], np.array([0]), obs["joint_state"][6:8], np.array([0, 0, 0])]
-        )  # Gripper/base dimensions are not delta-form, so add zeros there.
+        return _convert_model_action_to_command(
+            action,
+            obs["joint_state"],
+            self.action_mode,
+            logger=self.logger,
+        )
 
     def get_last_original_action_chunk(self) -> Optional[np.ndarray]:
         return self._last_original_action_chunk
@@ -1109,12 +1281,14 @@ class ExecTraceRecorder:
         *,
         enabled: bool,
         config_name: str,
+        action_mode: str = ACTION_MODE_RELATIVE,
         joint_dim_names: Optional[list[str]] = None,
         base_action_names: Optional[list[str]] = None,
         base_dir: str = "/home/policy/deploy_record",
     ):
         self.enabled = bool(enabled)
         self.config_name = str(config_name)
+        self.action_mode = _normalize_action_mode(action_mode) or ACTION_MODE_RELATIVE
         self.joint_dim_names = list(joint_dim_names or [])
         self.base_action_names = list(base_action_names or [])
         self.base_dir = str(base_dir)
@@ -1205,6 +1379,7 @@ class ExecTraceRecorder:
             "t": np.asarray(self._t, dtype=np.float64),
             "joint_state": np.stack(self._joint_state, axis=0),
             "action": np.stack(self._action, axis=0),
+            "action_mode": np.asarray(self.action_mode, dtype=str),
             "joint_dim_names": np.asarray(self.joint_dim_names, dtype=str),
             "base_action_names": np.asarray(self.base_action_names, dtype=str),
         }
@@ -1236,6 +1411,24 @@ class ExecTraceRecorder:
         action_original_delta = (
             np.stack(self._action_original_delta, axis=0) if len(self._action_original_delta) > 0 else None
         )
+        action_original_cmd = None
+        if action_original_delta is not None and t_action_original is not None and len(t) > 0:
+            idx = np.searchsorted(t, t_action_original, side="right") - 1
+            idx = np.clip(idx, 0, max(len(t) - 1, 0))
+            js = joint_state[idx]
+            action_original_cmd = np.stack(
+                [
+                    _convert_model_action_to_command(
+                        action_original_delta[k],
+                        js[k],
+                        self.action_mode,
+                        logger=self.logger,
+                        warn_on_unknown=False,
+                    )
+                    for k in range(int(action_original_delta.shape[0]))
+                ],
+                axis=0,
+            )
 
         n_joint = int(joint_state.shape[1]) if joint_state.ndim == 2 else 1
         n_action = int(action.shape[1]) if action.ndim == 2 else 1
@@ -1262,19 +1455,10 @@ class ExecTraceRecorder:
                 ax.plot(t, joint_state[:, i], label=f"{dim_name} (joint)")
             if has_action:
                 ax.plot(t, action[:, i], label=f"{dim_name} (action)")
-            if has_action_original and t_action_original is not None:
-                # Convert delta->command using joint_state sampled at the closest previous time.
-                idx = np.searchsorted(t, t_action_original, side="right") - 1
-                idx = np.clip(idx, 0, max(len(t) - 1, 0))
-                js = joint_state[idx]
-                original_cmd = np.array(action_original_delta[:, i], copy=True)
-                if i < 5:
-                    original_cmd = original_cmd + js[:, i]
-                elif 6 <= i < 8:
-                    original_cmd = original_cmd + js[:, i]
+            if has_action_original and t_action_original is not None and action_original_cmd is not None:
                 ax.plot(
                     t_action_original,
-                    original_cmd,
+                    action_original_cmd[:, i],
                     linestyle="None",
                     marker="+",
                     markersize=4.5,
@@ -1284,7 +1468,7 @@ class ExecTraceRecorder:
             ax.set_ylabel(dim_name)
             ax.grid(True, alpha=0.3)
             if i == 0:
-                ax.set_title("joint/action (same index overlaid when available)")
+                ax.set_title(f"joint/action (mode={self.action_mode})")
             if has_joint or has_action:
                 ax.legend(loc="upper right", fontsize=8)
 
@@ -1306,6 +1490,7 @@ def main(args=None):
     executor.add_node(node)
 
     config_name: str = str(node.param("config_name"))
+    requested_action_mode: str = str(node.param("action_mode"))
     policy_server_host: str = str(node.param("policy_server_host"))
     policy_server_port: int = int(node.param("policy_server_port"))
     policy_server_api_key: Optional[str] = str(node.param("policy_server_api_key"))
@@ -1344,6 +1529,7 @@ def main(args=None):
     )
 
     _loginfo(logger, "config_name: %s", config_name)
+    _loginfo(logger, "requested_action_mode: %s", requested_action_mode)
     _loginfo(logger, "policy_server_host: %s", policy_server_host)
     _loginfo(logger, "policy_server_port: %s", policy_server_port)
     _loginfo(logger, "policy_server_api_key set: %s", policy_server_api_key is not None)
@@ -1380,7 +1566,31 @@ def main(args=None):
         upsample=upsample,
         upsample_hz=upsample_hz,
         upsample_method=upsample_method,
+        action_mode=requested_action_mode,
+        fallback_config_name=config_name,
     )
+    _loginfo(logger, "resolved_action_mode: %s", policy.action_mode)
+    if policy.action_mode in (ACTION_MODE_ABSOLUTE, ACTION_MODE_STATE_DIFF):
+        if adopted_action_chunks > 1:
+            _logwarn(
+                logger,
+                "resolved_action_mode=%s with adopted_action_chunks=%d. For first bring-up on absolute/state_diff models, adopted_action_chunks:=1 is recommended.",
+                policy.action_mode,
+                adopted_action_chunks,
+            )
+        if upsample:
+            _logwarn(
+                logger,
+                "resolved_action_mode=%s with upsample=true. For first bring-up on absolute/state_diff models, upsample:=false is recommended.",
+                policy.action_mode,
+            )
+        if action_smoothing != ACTION_SMOOTHING_NONE:
+            _logwarn(
+                logger,
+                "resolved_action_mode=%s with action_smoothing=%s. For first bring-up on absolute/state_diff models, action_smoothing:=none is recommended.",
+                policy.action_mode,
+                action_smoothing,
+            )
 
     base_mask = np.array([True, True, True, True, True, False, True, True, False, False, False], dtype=bool)
     if smooth_gripper:
@@ -1398,6 +1608,7 @@ def main(args=None):
         logger=logger,
         enabled=save_exec_trace,
         config_name=trace_group_name,
+        action_mode=policy.action_mode,
         joint_dim_names=env.joint_state_names,
         base_action_names=env.base_action_names,
     )

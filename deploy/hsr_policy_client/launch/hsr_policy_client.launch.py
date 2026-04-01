@@ -9,6 +9,7 @@ def generate_launch_description() -> LaunchDescription:
     declared_arguments = [
         DeclareLaunchArgument("instruction", default_value="Grasp the apple."),
         DeclareLaunchArgument("config_name", default_value="remote_policy"),
+        DeclareLaunchArgument("action_mode", default_value="auto"),
         DeclareLaunchArgument(
             "policy_server_host",
             default_value=EnvironmentVariable("POLICY_SERVER_HOST", default_value="127.0.0.1"),
@@ -22,11 +23,11 @@ def generate_launch_description() -> LaunchDescription:
             default_value=EnvironmentVariable("POLICY_SERVER_API_KEY", default_value=""),
         ),
         DeclareLaunchArgument("update_freq", default_value="10"),
-        DeclareLaunchArgument("adopted_action_chunks", default_value="10"),
-        DeclareLaunchArgument("upsample", default_value="true"),
-        DeclareLaunchArgument("upsample_hz", default_value="100"),
+        DeclareLaunchArgument("adopted_action_chunks", default_value="1"),
+        DeclareLaunchArgument("upsample", default_value="false"),
+        DeclareLaunchArgument("upsample_hz", default_value="50"),
         DeclareLaunchArgument("upsample_method", default_value="spline"),
-        DeclareLaunchArgument("action_smoothing", default_value="ema"),
+        DeclareLaunchArgument("action_smoothing", default_value="none"),
         DeclareLaunchArgument("ema_alpha", default_value="0.2"),
         DeclareLaunchArgument("ma_window", default_value="5"),
         DeclareLaunchArgument("smooth_gripper", default_value="false"),
@@ -41,6 +42,7 @@ def generate_launch_description() -> LaunchDescription:
     parameters = {
         "instruction": LaunchConfiguration("instruction"),
         "config_name": LaunchConfiguration("config_name"),
+        "action_mode": LaunchConfiguration("action_mode"),
         "policy_server_host": LaunchConfiguration("policy_server_host"),
         "policy_server_port": ParameterValue(LaunchConfiguration("policy_server_port"), value_type=int),
         "policy_server_api_key": LaunchConfiguration("policy_server_api_key"),
