@@ -16,10 +16,6 @@ export POLICY_SERVER_PORT=8000
 ./RUN-DOCKER-CONTAINER.sh up
 ```
 
-`POLICY_CONFIG_NAME` は checkpoint を学習したときの config 名と一致させてください．
-server はこの config から `action_mode` を metadata として配信し，client はそれを使って arm/head の action 解釈を切り替えます．
-ここがずれると `absolute` や `state_diff` の deploy が崩れます．
-
 必要ならログ確認です．
 
 ```bash
@@ -81,10 +77,3 @@ ros2 launch hsr_policy_client hsr_policy_client.launch.py \
   action_mode:=absolute_arm_head_relative_gripper_base \
   instruction:='From a rectangle by relocating the mug that is not at a rectangle corner 3' 
 ```
-
-今の launch default は保守寄りです．
-`adopted_action_chunks:=1`, `upsample:=false`, `action_smoothing:=none` を既定にしてあり，
-特に `absolute` / `state_diff` の最初の切り分け向けにしています．
-server metadata が取れない古い構成を使う場合だけ，必要に応じて
-`action_mode:=relative` / `action_mode:=absolute_arm_head_relative_gripper_base` /
-`action_mode:=state_diff_arm_head_relative_gripper_base` を明示してください．

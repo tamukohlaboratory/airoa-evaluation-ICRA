@@ -59,10 +59,6 @@ export POLICY_RECORD_DIR=
 export POLICY_PYTORCH_DEVICE=cuda
 ```
 
-`POLICY_CONFIG_NAME` must match the training config that was used for the checkpoint.
-The server now exposes `action_mode` metadata and the client resolves arm/head action semantics from it.
-If `POLICY_CONFIG_NAME` is wrong, `absolute` and `state_diff` deployments can fail even when the checkpoint path is correct.
-
 ## 5. Start and verify containers
 
 ```bash
@@ -120,12 +116,6 @@ export POLICY_SERVER_PORT=8000
 ```bash
 ros2 launch hsr_policy_client hsr_policy_client.launch.py test_mode:=false
 ```
-
-The launch defaults are conservative (`adopted_action_chunks:=1`, `upsample:=false`, `action_smoothing:=none`).
-This is intentional for first bring-up, especially for `absolute` and `state_diff` checkpoints.
-If the server metadata is unavailable, you can override the client-side action semantics explicitly with
-`action_mode:=relative`, `action_mode:=absolute_arm_head_relative_gripper_base`, or
-`action_mode:=state_diff_arm_head_relative_gripper_base`.
 
 Optional pre-check in the same shell:
 

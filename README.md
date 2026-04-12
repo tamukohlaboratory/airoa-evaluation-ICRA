@@ -62,10 +62,6 @@ export POLICY_CONFIG_NAME=<openpi_config_name>
 export POLICY_PYTORCH_DEVICE=cuda
 ```
 
-`POLICY_CONFIG_NAME` must match the training config that was used for the checkpoint.
-The server exposes `action_mode` metadata and the client resolves arm/head action semantics from it.
-If `POLICY_CONFIG_NAME` is wrong, `absolute` and `state_diff` deployments can fail even when the checkpoint path is correct.
-
 ## 6. Test Flow
 
 Start containers:
