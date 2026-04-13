@@ -143,6 +143,12 @@ UPSAMPLE_METHOD_SPLINE = "spline"
 UPSAMPLE_METHOD_LINEAR = "linear"
 UPSAMPLE_METHODS = [UPSAMPLE_METHOD_SPLINE, UPSAMPLE_METHOD_LINEAR]
 
+RTC_SCHEDULE_LINEAR = "linear"
+RTC_SCHEDULE_EXP = "exp"
+RTC_SCHEDULE_ONES = "ones"
+RTC_SCHEDULE_ZEROS = "zeros"
+RTC_SCHEDULES = [RTC_SCHEDULE_LINEAR, RTC_SCHEDULE_EXP, RTC_SCHEDULE_ONES, RTC_SCHEDULE_ZEROS]
+
 ACTION_SMOOTHING_NONE = "none"
 ACTION_SMOOTHING_EMA = "ema"
 ACTION_SMOOTHING_MA = "moving_average"
@@ -414,7 +420,38 @@ def _make_policy_input_from_obs(obs: dict[str, Any], *, copy_arrays: bool) -> Op
     }
 
 
-def _blend_action_sequences(old_actions: np.ndarray, new_actions: np.ndarray, *, overlap_steps: int) -> np.ndarray:
+def _make_rtc_merge_weights(overlap_steps: int, *, schedule: str) -> np.ndarray:
+    overlap = max(int(overlap_steps), 0)
+    if overlap == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    normalized_schedule = str(schedule).strip().lower()
+    if normalized_schedule not in RTC_SCHEDULES:
+        normalized_schedule = RTC_SCHEDULE_EXP
+
+    if normalized_schedule == RTC_SCHEDULE_ZEROS:
+        return np.ones((overlap,), dtype=np.float32)
+    if normalized_schedule == RTC_SCHEDULE_ONES:
+        return np.zeros((overlap,), dtype=np.float32)
+
+    x = np.linspace(0.0, 1.0, overlap + 2, dtype=np.float32)[1:-1]
+    if normalized_schedule == RTC_SCHEDULE_LINEAR:
+        return x
+
+    # Exponential schedule keeps the prefix closer to the old chunk at first,
+    # then transitions more aggressively toward the new chunk.
+    scaled = np.exp(4.0 * x) - 1.0
+    denom = float(np.exp(4.0) - 1.0)
+    return (scaled / denom).astype(np.float32, copy=False)
+
+
+def _merge_rtc_action_sequences(
+    old_actions: np.ndarray,
+    new_actions: np.ndarray,
+    *,
+    execution_horizon: int,
+    schedule: str,
+) -> np.ndarray:
     old_actions = np.asarray(old_actions, dtype=np.float32)
     new_actions = np.asarray(new_actions, dtype=np.float32)
     if old_actions.ndim != 2 or new_actions.ndim != 2:
@@ -429,14 +466,15 @@ def _blend_action_sequences(old_actions: np.ndarray, new_actions: np.ndarray, *,
     if new_actions.shape[0] == 0:
         return old_actions
 
-    overlap = min(max(int(overlap_steps), 0), old_actions.shape[0], new_actions.shape[0])
+    overlap = min(max(int(execution_horizon), 0), old_actions.shape[0], new_actions.shape[0])
     if overlap == 0:
         return new_actions
 
-    blended = np.empty((overlap, old_actions.shape[1]), dtype=np.float32)
-    for i in range(overlap):
-        alpha = float(i + 1) / float(overlap + 1)
-        blended[i] = ((1.0 - alpha) * old_actions[i] + alpha * new_actions[i]).astype(np.float32, copy=False)
+    weights = _make_rtc_merge_weights(overlap, schedule=schedule)
+    blended = ((1.0 - weights[:, None]) * old_actions[:overlap] + weights[:, None] * new_actions[:overlap]).astype(
+        np.float32,
+        copy=False,
+    )
 
     return np.concatenate([blended, new_actions[overlap:]], axis=0).astype(np.float32, copy=False)
 
@@ -856,9 +894,12 @@ class OpenpiPolicy:
         upsample: bool = False,
         upsample_hz: int = 50,
         upsample_method: str = UPSAMPLE_METHOD_SPLINE,
-        enable_async_replan: bool = False,
-        replan_after_chunks: int = 1,
-        blend_overlap_chunks: int = 1,
+        use_mbr: bool = False,
+        mbr_num_candidates: int = 1,
+        enable_rtc: bool = False,
+        rtc_queue_threshold: int = 0,
+        rtc_execution_horizon: int = 3,
+        rtc_schedule: str = RTC_SCHEDULE_EXP,
         action_mode: str = ACTION_MODE_AUTO,
         fallback_config_name: Optional[str] = None,
     ):
@@ -943,9 +984,21 @@ class OpenpiPolicy:
         self.action_hz: int = action_hz
         self.upsample: bool = upsample
         self.upsample_hz: int = upsample_hz
-        self.enable_async_replan: bool = bool(enable_async_replan)
-        self.replan_after_chunks: int = max(int(replan_after_chunks), 1)
-        self.blend_overlap_chunks: int = max(int(blend_overlap_chunks), 1)
+        self.execution_hz: int = self.upsample_hz if self.upsample else self.action_hz
+        self.use_mbr: bool = bool(use_mbr)
+        self.mbr_num_candidates: int = max(int(mbr_num_candidates), 1)
+        self.enable_rtc: bool = bool(enable_rtc)
+        self.rtc_queue_threshold: int = int(rtc_queue_threshold)
+        self.rtc_execution_horizon: int = max(int(rtc_execution_horizon), 0)
+        self.rtc_schedule: str = str(rtc_schedule).strip().lower()
+        if self.rtc_schedule not in RTC_SCHEDULES:
+            rospy.logwarn(
+                "Unknown rtc_schedule '%s'. Falling back to '%s'. Available: %s",
+                self.rtc_schedule,
+                RTC_SCHEDULE_EXP,
+                ", ".join(RTC_SCHEDULES),
+            )
+            self.rtc_schedule = RTC_SCHEDULE_EXP
         self.upsample_method: str = str(upsample_method)
         if self.upsample_method not in UPSAMPLE_METHODS:
             rospy.logwarn(
@@ -967,10 +1020,12 @@ class OpenpiPolicy:
         self._last_original_action_chunk: Optional[np.ndarray] = None
         self._infer_latencies_s: list[float] = []
         self._replan_latencies_s: list[float] = []
+        self._rtc_latency_window_s: deque = deque(maxlen=20)
         self._latest_policy_input: Optional[dict[str, Any]] = None
         self._prefetched_raw_action_chunk: Optional[np.ndarray] = None
+        self._prefetched_execution_chunk: Optional[np.ndarray] = None
+        self._prefetched_original_action_chunk_for_trace: Optional[np.ndarray] = None
         self._plan_generation = 0
-        self._execution_steps_emitted = 0
         self._replan_executor: Optional[futures.ThreadPoolExecutor] = None
         self._replan_policy: Optional[WebsocketClientPolicy] = None
         self._pending_replan_future: Optional[futures.Future] = None
@@ -981,59 +1036,41 @@ class OpenpiPolicy:
         self._replan_discarded = 0
         self._replan_failed = 0
 
-        if self.enable_async_replan and self.adopted_action_chunks <= 1:
+        if self.enable_rtc and self.execution_action_chunks <= 1:
             rospy.logwarn(
-                "Async replanning requires adopted_action_chunks > 1. Disabling async replanning."
+                "RTC-style chunking requires at least 2 execution steps per chunk. Disabling RTC."
             )
-            self.enable_async_replan = False
+            self.enable_rtc = False
 
-        if self.enable_async_replan and self.replan_after_chunks >= self.adopted_action_chunks:
-            clamped = max(self.adopted_action_chunks - 1, 1)
-            if clamped == self.replan_after_chunks:
-                rospy.logwarn(
-                    "Async replanning trigger is not before the end of the chunk. Disabling async replanning."
-                )
-                self.enable_async_replan = False
-            else:
-                rospy.logwarn(
-                    "replan_after_chunks=%s must be smaller than adopted_action_chunks=%s. "
-                    "Clamping to %s.",
-                    self.replan_after_chunks,
-                    self.adopted_action_chunks,
-                    clamped,
-                )
-                self.replan_after_chunks = clamped
+        if self.enable_rtc and self.use_mbr:
+            rospy.logwarn(
+                "RTC-style async chunking currently assumes single-sample async inference. "
+                "Regular synchronous inference still honors use_mbr, but background RTC fetches do not."
+            )
 
-        self._replan_trigger_exec_steps: Optional[int] = None
-        self._blend_overlap_exec_steps: Optional[int] = None
-        if self.enable_async_replan:
-            self._replan_trigger_exec_steps = max(
-                int(round(self.replan_after_chunks * float(self.execution_action_chunks) / float(self.adopted_action_chunks))),
-                1,
-            )
-            self._blend_overlap_exec_steps = max(
-                int(round(self.blend_overlap_chunks * float(self.execution_action_chunks) / float(self.adopted_action_chunks))),
-                1,
-            )
-            self._replan_executor = futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="hsr_policy_replan")
+        if self.enable_rtc:
+            self._replan_executor = futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="hsr_policy_rtc")
             rospy.loginfo(
-                "Async replanning enabled: replan_after_chunks=%s (~%s exec steps), "
-                "blend_overlap_chunks=%s (~%s exec steps)",
-                self.replan_after_chunks,
-                self._replan_trigger_exec_steps,
-                self.blend_overlap_chunks,
-                self._blend_overlap_exec_steps,
+                "RTC-style chunking enabled: rtc_queue_threshold=%s, rtc_execution_horizon=%s, "
+                "rtc_schedule=%s, execution_action_chunks=%s, use_mbr=%s",
+                self.rtc_queue_threshold,
+                self.rtc_execution_horizon,
+                self.rtc_schedule,
+                self.execution_action_chunks,
+                self.use_mbr,
             )
 
     def _record_infer_timing(self, *, start_s: float, end_s: float) -> None:
         latency = float(end_s - start_s)
         if latency >= 0:
             self._infer_latencies_s.append(latency)
+            self._rtc_latency_window_s.append(latency)
 
     def _record_replan_timing(self, *, latency_s: float) -> None:
         latency = float(latency_s)
         if latency >= 0:
             self._replan_latencies_s.append(latency)
+            self._rtc_latency_window_s.append(latency)
 
     def _prepare_execution_chunk(self, raw_action_chunk: np.ndarray) -> np.ndarray:
         action_chunk = np.asarray(raw_action_chunk[: self.adopted_action_chunks], dtype=np.float32)
@@ -1053,14 +1090,83 @@ class OpenpiPolicy:
             out_steps=self.execution_action_chunks,
         )
 
-    def _install_new_plan(self, raw_action_chunk: np.ndarray) -> np.ndarray:
+    def _install_new_plan(
+        self,
+        raw_action_chunk: np.ndarray,
+        *,
+        execution_chunk: Optional[np.ndarray] = None,
+        original_action_chunk_for_trace: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         raw_action_chunk = np.asarray(raw_action_chunk, dtype=np.float32)
-        execution_chunk = self._prepare_execution_chunk(raw_action_chunk)
-        self._last_original_action_chunk = raw_action_chunk[: self.adopted_action_chunks]
+        if execution_chunk is None:
+            execution_chunk = self._prepare_execution_chunk(raw_action_chunk)
+        else:
+            execution_chunk = np.asarray(execution_chunk, dtype=np.float32)
+        if execution_chunk.ndim != 2 or execution_chunk.shape[0] == 0:
+            raise ValueError("execution_chunk must be a non-empty 2D array.")
+        if original_action_chunk_for_trace is None:
+            original_action_chunk_for_trace = raw_action_chunk[: self.adopted_action_chunks]
+        self._last_original_action_chunk = np.asarray(original_action_chunk_for_trace, dtype=np.float32)
         self.action_queue = deque(execution_chunk[1:], maxlen=self.execution_action_chunks)
         self._plan_generation += 1
-        self._execution_steps_emitted = 0
         return execution_chunk
+
+    def _estimate_rtc_inference_delay_steps(self, *, latency_s: Optional[float] = None) -> int:
+        if latency_s is None:
+            if not self._rtc_latency_window_s:
+                return 0
+            latency_s = max(float(v) for v in self._rtc_latency_window_s)
+        return max(int(np.ceil(float(latency_s) * float(self.execution_hz))), 0)
+
+    def _resolve_rtc_queue_threshold_steps(self) -> int:
+        if self.rtc_queue_threshold > 0:
+            return self.rtc_queue_threshold
+        delay_steps = self._estimate_rtc_inference_delay_steps()
+        auto_threshold = max(delay_steps + max(self.rtc_execution_horizon, 1), 1)
+        if self.execution_action_chunks > 1:
+            auto_threshold = min(auto_threshold, self.execution_action_chunks - 1)
+        return auto_threshold
+
+    def _execution_delay_to_coarse_steps(self, delay_steps: int) -> int:
+        delay = max(int(delay_steps), 0)
+        if delay == 0:
+            return 0
+        return max(int(np.floor(delay * float(self.action_hz) / float(self.execution_hz))), 0)
+
+    def _trim_original_action_chunk_for_delay(self, raw_action_chunk: np.ndarray, *, delay_steps: int) -> np.ndarray:
+        raw_action_chunk = np.asarray(raw_action_chunk, dtype=np.float32)
+        trimmed = raw_action_chunk[: self.adopted_action_chunks]
+        coarse_delay_steps = min(self._execution_delay_to_coarse_steps(delay_steps), max(trimmed.shape[0] - 1, 0))
+        if coarse_delay_steps <= 0:
+            return trimmed
+        return trimmed[coarse_delay_steps:]
+
+    def _build_policy_request(
+        self,
+        policy_input: dict[str, Any],
+        *,
+        use_mbr_override: Optional[bool] = None,
+        mbr_num_candidates_override: Optional[int] = None,
+    ) -> dict[str, Any]:
+        request = {
+            "head_rgb": policy_input["head_rgb"],
+            "hand_rgb": policy_input["hand_rgb"],
+            "state": policy_input["state"],
+            "prompt": policy_input["prompt"],
+        }
+        use_mbr = self.use_mbr if use_mbr_override is None else bool(use_mbr_override)
+        mbr_num_candidates = (
+            self.mbr_num_candidates if mbr_num_candidates_override is None else int(mbr_num_candidates_override)
+        )
+        request["use_mbr"] = bool(use_mbr)
+        request["mbr_num_candidates"] = max(int(mbr_num_candidates), 1)
+        return request
+
+    def _infer_with_client(self, policy_client: WebsocketClientPolicy, request: dict[str, Any]) -> tuple[np.ndarray, float]:
+        start_s = time.perf_counter()
+        outputs = policy_client.infer(request)
+        end_s = time.perf_counter()
+        return np.asarray(outputs["actions"], dtype=np.float32), float(end_s - start_s)
 
     def _run_async_replan(self, policy_input: dict[str, Any]) -> tuple[np.ndarray, float]:
         if self._replan_policy is None:
@@ -1069,10 +1175,12 @@ class OpenpiPolicy:
                 port=self._policy_server_port,
                 api_key=self._policy_server_api_key,
             )
-        start_s = time.perf_counter()
-        outputs = self._replan_policy.infer(policy_input)
-        end_s = time.perf_counter()
-        return np.asarray(outputs["actions"], dtype=np.float32), float(end_s - start_s)
+        request = self._build_policy_request(
+            policy_input,
+            use_mbr_override=False,
+            mbr_num_candidates_override=1,
+        )
+        return self._infer_with_client(self._replan_policy, request)
 
     def _refresh_latest_policy_input(self, obs: dict[str, Any]) -> None:
         policy_input = _make_policy_input_from_obs(obs, copy_arrays=True)
@@ -1080,7 +1188,7 @@ class OpenpiPolicy:
             self._latest_policy_input = policy_input
 
     def _maybe_start_async_replan(self) -> None:
-        if not self.enable_async_replan or self._replan_executor is None:
+        if not self.enable_rtc or self._replan_executor is None:
             return
         if self._pending_replan_future is not None:
             return
@@ -1088,7 +1196,7 @@ class OpenpiPolicy:
             return
         if len(self.action_queue) == 0:
             return
-        if self._replan_trigger_exec_steps is None or self._execution_steps_emitted < self._replan_trigger_exec_steps:
+        if len(self.action_queue) > self._resolve_rtc_queue_threshold_steps():
             return
 
         policy_input = {
@@ -1114,7 +1222,10 @@ class OpenpiPolicy:
             raw_action_chunk, latency_s = future.result()
         except Exception as e:
             self._replan_failed += 1
-            rospy.logwarn("Async replanning failed: %s", e)
+            rospy.logwarn("RTC background inference failed: %s", e)
+            return
+
+        if raw_action_chunk is None:
             return
 
         self._record_replan_timing(latency_s=latency_s)
@@ -1122,23 +1233,35 @@ class OpenpiPolicy:
             self._replan_discarded += 1
             return
 
+        inference_delay_steps = self._estimate_rtc_inference_delay_steps(latency_s=latency_s)
         if len(self.action_queue) == 0:
+            execution_chunk = self._prepare_execution_chunk(raw_action_chunk)
+            if inference_delay_steps >= execution_chunk.shape[0]:
+                self._replan_discarded += 1
+                return
             self._prefetched_raw_action_chunk = np.asarray(raw_action_chunk, dtype=np.float32)
+            self._prefetched_execution_chunk = execution_chunk[inference_delay_steps:]
+            self._prefetched_original_action_chunk_for_trace = self._trim_original_action_chunk_for_delay(
+                raw_action_chunk,
+                delay_steps=inference_delay_steps,
+            )
             self._replan_prefetched += 1
             return
 
         new_execution_chunk = self._prepare_execution_chunk(raw_action_chunk)
-        overlap_steps = self._blend_overlap_exec_steps or 0
+        if inference_delay_steps >= new_execution_chunk.shape[0]:
+            self._replan_discarded += 1
+            return
+        new_execution_chunk = new_execution_chunk[inference_delay_steps:]
         old_remaining = np.asarray(list(self.action_queue), dtype=np.float32)
-        merged_remaining = _blend_action_sequences(
+        merged_remaining = _merge_rtc_action_sequences(
             old_remaining,
             new_execution_chunk,
-            overlap_steps=overlap_steps,
+            execution_horizon=self.rtc_execution_horizon,
+            schedule=self.rtc_schedule,
         )
         self.action_queue = deque(merged_remaining, maxlen=self.execution_action_chunks)
-        self._last_original_action_chunk = np.asarray(raw_action_chunk[: self.adopted_action_chunks], dtype=np.float32)
         self._plan_generation += 1
-        self._execution_steps_emitted = 0
         self._replan_applied += 1
 
     def log_inference_stats(self) -> None:
@@ -1164,7 +1287,7 @@ class OpenpiPolicy:
         if replan_lat is not None:
             n_replan, mean_replan, var_replan = replan_lat
             rospy.loginfo(
-                "Async replan latency: n=%d mean=%.1fms var=%.3f(ms^2) submitted=%d applied=%d prefetched=%d discarded=%d failed=%d",
+                "RTC background inference latency: n=%d mean=%.1fms var=%.3f(ms^2) submitted=%d applied=%d prefetched=%d discarded=%d failed=%d",
                 n_replan,
                 mean_replan * 1e3,
                 var_replan * 1e6,
@@ -1179,6 +1302,16 @@ class OpenpiPolicy:
         if self._replan_executor is not None:
             self._replan_executor.shutdown(wait=False, cancel_futures=True)
             self._replan_executor = None
+        try:
+            self.policy.close()
+        except Exception:
+            pass
+        if self._replan_policy is not None:
+            try:
+                self._replan_policy.close()
+            except Exception:
+                pass
+            self._replan_policy = None
 
     def act(self, obs: dict[str, Any]) -> np.ndarray:
         """
@@ -1212,7 +1345,6 @@ class OpenpiPolicy:
         self._maybe_start_async_replan()
         if len(self.action_queue) > 0:
             action = self.action_queue.popleft()
-            self._execution_steps_emitted += 1
             return _convert_model_action_to_command(
                 action,
                 obs["joint_state"],
@@ -1220,19 +1352,28 @@ class OpenpiPolicy:
                 logger=self.logger,
             )
         raw_action_chunk = self._prefetched_raw_action_chunk
+        prefetched_execution_chunk = self._prefetched_execution_chunk
+        prefetched_original_action_chunk_for_trace = self._prefetched_original_action_chunk_for_trace
         self._prefetched_raw_action_chunk = None
+        self._prefetched_execution_chunk = None
+        self._prefetched_original_action_chunk_for_trace = None
         if raw_action_chunk is None:
             policy_input = _make_policy_input_from_obs(obs, copy_arrays=False)
             if policy_input is None:
                 raise ValueError("Full observation is required when the action queue is empty.")
             infer_start_s = time.perf_counter()
-            raw_action_chunk = np.asarray(self.policy.infer(policy_input)["actions"], dtype=np.float32)
+            request = self._build_policy_request(policy_input)
+            raw_action_chunk = np.asarray(self.policy.infer(request)["actions"], dtype=np.float32)
             infer_end_s = time.perf_counter()
             self._record_infer_timing(start_s=infer_start_s, end_s=infer_end_s)
-
-        action_chunk = self._install_new_plan(raw_action_chunk)
+            action_chunk = self._install_new_plan(raw_action_chunk)
+        else:
+            action_chunk = self._install_new_plan(
+                raw_action_chunk,
+                execution_chunk=prefetched_execution_chunk,
+                original_action_chunk_for_trace=prefetched_original_action_chunk_for_trace,
+            )
         action = action_chunk[0]
-        self._execution_steps_emitted += 1
 
         return _convert_model_action_to_command(
             action,
@@ -1453,11 +1594,36 @@ def main():
     upsample: bool = rospy.get_param("~upsample", False)
     upsample_hz: int = rospy.get_param("~upsample_hz", 50)
     upsample_method: str = rospy.get_param("~upsample_method", UPSAMPLE_METHOD_SPLINE)
-    enable_async_replan: bool = _param_to_bool(rospy.get_param("~enable_async_replan", False))
-    replan_after_chunks: int = int(rospy.get_param("~replan_after_chunks", 1))
-    blend_overlap_chunks: int = int(rospy.get_param("~blend_overlap_chunks", 1))
+    use_mbr: bool = _param_to_bool(rospy.get_param("~use_mbr", False))
+    mbr_num_candidates: int = int(rospy.get_param("~mbr_num_candidates", 1))
+    if mbr_num_candidates < 1:
+        mbr_num_candidates = 1
     action_mode: str = rospy.get_param("~action_mode", ACTION_MODE_AUTO)
     execution_freq: int = upsample_hz if upsample else update_freq
+    execution_action_chunks = max(
+        int(round(int(adopted_action_chunks) * float(execution_freq) / float(update_freq))),
+        1,
+    )
+
+    enable_rtc: bool = _param_to_bool(
+        rospy.get_param("~enable_rtc", rospy.get_param("~enable_async_replan", False))
+    )
+    rtc_queue_threshold: int = int(rospy.get_param("~rtc_queue_threshold", 0))
+    if (not rospy.has_param("~rtc_queue_threshold")) and rospy.has_param("~replan_after_chunks"):
+        legacy_replan_after_chunks = max(int(rospy.get_param("~replan_after_chunks", 1)), 1)
+        legacy_replan_exec_steps = max(
+            int(round(legacy_replan_after_chunks * float(execution_action_chunks) / float(adopted_action_chunks))),
+            1,
+        )
+        rtc_queue_threshold = max(execution_action_chunks - legacy_replan_exec_steps, 1)
+        rospy.logwarn(
+            "replan_after_chunks is deprecated. Converting it to rtc_queue_threshold=%s.",
+            rtc_queue_threshold,
+        )
+    rtc_execution_horizon: int = int(
+        rospy.get_param("~rtc_execution_horizon", rospy.get_param("~blend_overlap_chunks", 1))
+    )
+    rtc_schedule: str = str(rospy.get_param("~rtc_schedule", RTC_SCHEDULE_EXP))
 
     action_smoothing: str = rospy.get_param("~action_smoothing", ACTION_SMOOTHING_NONE)
     ema_alpha: float = rospy.get_param("~ema_alpha", 0.2)
@@ -1490,9 +1656,12 @@ def main():
     rospy.loginfo("upsample: %s", upsample)
     rospy.loginfo("upsample_hz: %s", upsample_hz)
     rospy.loginfo("upsample_method: %s", upsample_method)
-    rospy.loginfo("enable_async_replan: %s", enable_async_replan)
-    rospy.loginfo("replan_after_chunks: %s", replan_after_chunks)
-    rospy.loginfo("blend_overlap_chunks: %s", blend_overlap_chunks)
+    rospy.loginfo("use_mbr: %s", use_mbr)
+    rospy.loginfo("mbr_num_candidates: %s", mbr_num_candidates)
+    rospy.loginfo("enable_rtc: %s", enable_rtc)
+    rospy.loginfo("rtc_queue_threshold: %s", rtc_queue_threshold)
+    rospy.loginfo("rtc_execution_horizon: %s", rtc_execution_horizon)
+    rospy.loginfo("rtc_schedule: %s", rtc_schedule)
     rospy.loginfo("action_mode: %s", action_mode)
     rospy.loginfo("action_smoothing: %s", action_smoothing)
     rospy.loginfo("ema_alpha: %s", ema_alpha)
@@ -1521,9 +1690,12 @@ def main():
         upsample=upsample,
         upsample_hz=upsample_hz,
         upsample_method=upsample_method,
-        enable_async_replan=enable_async_replan,
-        replan_after_chunks=replan_after_chunks,
-        blend_overlap_chunks=blend_overlap_chunks,
+        use_mbr=use_mbr,
+        mbr_num_candidates=mbr_num_candidates,
+        enable_rtc=enable_rtc,
+        rtc_queue_threshold=rtc_queue_threshold,
+        rtc_execution_horizon=rtc_execution_horizon,
+        rtc_schedule=rtc_schedule,
         action_mode=action_mode,
         fallback_config_name=config_name,
     )

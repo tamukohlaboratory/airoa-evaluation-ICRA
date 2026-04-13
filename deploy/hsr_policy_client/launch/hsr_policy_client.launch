@@ -9,9 +9,10 @@
     <arg name="upsample" default="true"/>
     <arg name="upsample_hz" default="30"/>
     <arg name="upsample_method" default="spline"/>
-    <arg name="enable_async_replan" default="true"/>
-    <arg name="replan_after_chunks" default="2"/>
-    <arg name="blend_overlap_chunks" default="3"/>
+    <arg name="enable_rtc" default="true"/>
+    <arg name="rtc_queue_threshold" default="0"/>
+    <arg name="rtc_execution_horizon" default="5"/>
+    <arg name="rtc_schedule" default="exp"/>
     <arg name="action_smoothing" default="ema"/>
     <arg name="action_mode" default="auto"/>
     <arg name="ema_alpha" default="0.2"/>
@@ -36,9 +37,10 @@
         <param name="upsample" value="$(arg upsample)"/>
         <param name="upsample_hz" value="$(arg upsample_hz)"/>
         <param name="upsample_method" value="$(arg upsample_method)"/>
-        <param name="enable_async_replan" value="$(arg enable_async_replan)"/>
-        <param name="replan_after_chunks" value="$(arg replan_after_chunks)"/>
-        <param name="blend_overlap_chunks" value="$(arg blend_overlap_chunks)"/>
+        <param name="enable_rtc" value="$(arg enable_rtc)"/>
+        <param name="rtc_queue_threshold" value="$(arg rtc_queue_threshold)"/>
+        <param name="rtc_execution_horizon" value="$(arg rtc_execution_horizon)"/>
+        <param name="rtc_schedule" value="$(arg rtc_schedule)"/>
         <param name="action_smoothing" value="$(arg action_smoothing)"/>
         <param name="action_mode" value="$(arg action_mode)"/>
         <param name="ema_alpha" value="$(arg ema_alpha)"/>
