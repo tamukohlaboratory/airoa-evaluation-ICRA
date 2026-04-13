@@ -10,18 +10,58 @@ from openpi.training import config as train_config
 from runtime_core.websocket_policy_server import WebsocketPolicyServer
 
 
+def _str_to_bool(value: str) -> bool:
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"Expected a positive integer, got {value!r}")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Serve OpenPI policy as websocket server for HSR client")
-    parser.add_argument("--checkpoint-dir", required=True, help="Path to checkpoint directory")
-    parser.add_argument("--config-name", required=True, help="Train config name (e.g. pi05_hsr)")
+    parser = argparse.ArgumentParser(
+        description="Serve OpenPI policy as websocket server for HSR client"
+    )
+    parser.add_argument(
+        "--checkpoint-dir", required=True, help="Path to checkpoint directory"
+    )
+    parser.add_argument(
+        "--config-name", required=True, help="Train config name (e.g. pi05_hsr)"
+    )
     parser.add_argument("--host", default="0.0.0.0", help="Bind host")
     parser.add_argument("--port", type=int, default=8000, help="Bind port")
-    parser.add_argument("--default-prompt", default=None, help="Fallback prompt if prompt key is missing")
-    parser.add_argument("--record-dir", default=None, help="Optional directory for policy records")
+    parser.add_argument(
+        "--default-prompt",
+        default=None,
+        help="Fallback prompt if prompt key is missing",
+    )
+    parser.add_argument(
+        "--record-dir", default=None, help="Optional directory for policy records"
+    )
     parser.add_argument(
         "--pytorch-device",
         default=None,
         help='Optional torch device override (e.g. "cuda", "cuda:0", "cpu")',
+    )
+    parser.add_argument(
+        "--use-mbr",
+        type=_str_to_bool,
+        default=False,
+        help="Enable Minimum Bayes-Risk decoding during inference (true/false)",
+    )
+    parser.add_argument(
+        "--mbr-num-candidates",
+        type=_positive_int,
+        default=8,
+        help="Number of candidate action chunks to sample when MBR decoding is enabled",
     )
     return parser.parse_args()
 
@@ -41,6 +81,8 @@ def main() -> None:
         checkpoint_dir,
         default_prompt=args.default_prompt,
         pytorch_device=args.pytorch_device,
+        use_mbr=args.use_mbr,
+        mbr_num_candidates=args.mbr_num_candidates,
     )
 
     if args.record_dir:
@@ -58,20 +100,26 @@ def main() -> None:
             "convert_gripper": getattr(data_cfg, "convert_gripper", None),
             "adapt_to_pi": getattr(data_cfg, "adapt_to_pi", None),
             "base_action_dim": getattr(data_cfg, "base_action_dim", None),
+            "mbr_enabled_default": args.use_mbr,
+            "mbr_num_candidates_default": args.mbr_num_candidates,
         }
     )
 
     logging.info(
-        "Serving policy config=%s action_mode=%s checkpoint=%s on %s:%s",
+        "Serving policy config=%s action_mode=%s checkpoint=%s mbr=%s mbr_num_candidates=%s on %s:%s",
         config_name,
         metadata.get("action_mode"),
         checkpoint_dir,
+        args.use_mbr,
+        args.mbr_num_candidates,
         args.host,
         args.port,
     )
     # NOTE: Keep the OpenPI implementation as needed, but do not change the next two lines.
     # They are the fixed websocket serving contract for the HSR client runtime.
-    server = WebsocketPolicyServer(policy=policy, host=args.host, port=args.port, metadata=metadata)
+    server = WebsocketPolicyServer(
+        policy=policy, host=args.host, port=args.port, metadata=metadata
+    )
     server.serve_forever()
 
 

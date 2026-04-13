@@ -39,8 +39,14 @@ export HSR_IP=192.168.0.2
 export ROS_MASTER_URI=http://192.168.0.2:11311
 export ROS_IP=192.168.0.10
 export TEST_MODE=false
-export POLICY_SERVER_HOST=172.30.21.164 # HMA WiFi 5
+export POLICY_SERVER_HOST=10.65.9.229
 export POLICY_SERVER_PORT=8000
+
+
+# MBR を使う場合
+export POLICY_USE_MBR=true
+export POLICY_MBR_NUM_CANDIDATES=8
+
 """
 
 ```

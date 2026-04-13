@@ -18,6 +18,8 @@
     <arg name="gripper_mode" default="hybrid"/>
     <arg name="save_exec_trace" default="false"/>
     <arg name="test_mode" default="true"/>
+    <arg name="use_mbr" default=""/>
+    <arg name="mbr_num_candidates" default="0"/>
     <arg name="instruction" default="Pick up an object"/>
 
 
@@ -40,6 +42,8 @@
         <param name="gripper_mode" value="$(arg gripper_mode)"/>
         <param name="save_exec_trace" value="$(arg save_exec_trace)"/>
         <param name="test_mode" value="$(arg test_mode)"/>
+        <param name="use_mbr" value="$(arg use_mbr)"/>
+        <param name="mbr_num_candidates" value="$(arg mbr_num_candidates)"/>
         <param name="instruction" value="$(arg instruction)"/>
     </node>
 
