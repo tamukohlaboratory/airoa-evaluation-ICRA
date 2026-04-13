@@ -51,18 +51,58 @@ def test_select_mbr_candidate_prefers_consensus_candidate():
     assert risks[selected_idx] < risks[2]
 
 
-def test_policy_infer_uses_mbr_when_enabled():
+def test_select_mbr_candidate_uses_reference_set_when_provided():
+    decision_candidates = [
+        np.array([[0.0]], dtype=np.float32),
+        np.array([[10.0]], dtype=np.float32),
+    ]
+    reference_candidates = [
+        np.array([[9.0]], dtype=np.float32),
+        np.array([[10.0]], dtype=np.float32),
+        np.array([[11.0]], dtype=np.float32),
+    ]
+
+    selected_idx, risks = _policy._select_mbr_candidate(decision_candidates, reference_candidates)
+
+    assert selected_idx == 1
+    assert risks[selected_idx] < risks[0]
+
+
+def test_select_mbr_candidate_wraps_angular_dimensions():
+    decision_candidates = [
+        np.array([[np.pi - 0.05]], dtype=np.float32),
+        np.array([[0.0]], dtype=np.float32),
+    ]
+    reference_candidates = [
+        np.array([[-np.pi + 0.05]], dtype=np.float32),
+        np.array([[-np.pi + 0.02]], dtype=np.float32),
+    ]
+
+    selected_idx, risks = _policy._select_mbr_candidate(
+        decision_candidates,
+        reference_candidates,
+        action_names=["base_theta"],
+    )
+
+    assert selected_idx == 0
+    assert risks[selected_idx] < risks[1]
+
+
+def test_policy_infer_uses_separate_reference_candidates():
     policy = _policy.Policy(
         _DummyTorchModel(),
         is_pytorch=True,
         use_mbr=True,
-        mbr_num_candidates=3,
+        mbr_num_candidates=2,
+        mbr_num_reference_candidates=3,
     )
     noises = np.array(
         [
             [[0.0]],
-            [[0.1]],
             [[10.0]],
+            [[9.0]],
+            [[10.0]],
+            [[11.0]],
         ],
         dtype=np.float32,
     )
@@ -71,7 +111,8 @@ def test_policy_infer_uses_mbr_when_enabled():
 
     np.testing.assert_allclose(outputs["actions"], noises[1])
     assert outputs["policy_timing"]["mbr_enabled"] is True
-    assert outputs["policy_timing"]["mbr_num_candidates"] == 3
+    assert outputs["policy_timing"]["mbr_num_candidates"] == 2
+    assert outputs["policy_timing"]["mbr_num_reference_candidates"] == 3
     assert outputs["policy_timing"]["mbr_selected_index"] == 1
 
 

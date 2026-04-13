@@ -60,8 +60,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mbr-num-candidates",
         type=_positive_int,
-        default=8,
-        help="Number of candidate action chunks to sample when MBR decoding is enabled",
+        default=4,
+        help="Number of decision candidates to sample when MBR decoding is enabled",
+    )
+    parser.add_argument(
+        "--mbr-num-reference-candidates",
+        type=_positive_int,
+        default=None,
+        help="Number of reference action chunks to sample when MBR decoding is enabled",
     )
     return parser.parse_args()
 
@@ -83,6 +89,7 @@ def main() -> None:
         pytorch_device=args.pytorch_device,
         use_mbr=args.use_mbr,
         mbr_num_candidates=args.mbr_num_candidates,
+        mbr_num_reference_candidates=args.mbr_num_reference_candidates,
     )
 
     if args.record_dir:
@@ -102,16 +109,23 @@ def main() -> None:
             "base_action_dim": getattr(data_cfg, "base_action_dim", None),
             "mbr_enabled_default": args.use_mbr,
             "mbr_num_candidates_default": args.mbr_num_candidates,
+            "mbr_num_reference_candidates_default": (
+                args.mbr_num_reference_candidates
+                if args.mbr_num_reference_candidates is not None
+                else args.mbr_num_candidates
+            ),
         }
     )
 
     logging.info(
-        "Serving policy config=%s action_mode=%s checkpoint=%s mbr=%s mbr_num_candidates=%s on %s:%s",
+        "Serving policy config=%s action_mode=%s checkpoint=%s mbr=%s "
+        "mbr_num_candidates=%s mbr_num_reference_candidates=%s on %s:%s",
         config_name,
         metadata.get("action_mode"),
         checkpoint_dir,
         args.use_mbr,
         args.mbr_num_candidates,
+        metadata["mbr_num_reference_candidates_default"],
         args.host,
         args.port,
     )

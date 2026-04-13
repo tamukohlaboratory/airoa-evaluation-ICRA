@@ -24,6 +24,7 @@ def create_trained_policy(
     pytorch_device: str | None = None,
     use_mbr: bool = False,
     mbr_num_candidates: int = 8,
+    mbr_num_reference_candidates: int | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -40,7 +41,9 @@ def create_trained_policy(
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
         use_mbr: Whether to enable MBR decoding by default during inference.
-        mbr_num_candidates: Number of candidate action chunks to sample when MBR is enabled.
+        mbr_num_candidates: Number of decision candidates to sample when MBR is enabled.
+        mbr_num_reference_candidates: Number of reference action chunks to sample when MBR is enabled.
+            If None, defaults to `mbr_num_candidates`.
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
@@ -97,4 +100,5 @@ def create_trained_policy(
         pytorch_device=pytorch_device if is_pytorch else None,
         use_mbr=use_mbr,
         mbr_num_candidates=mbr_num_candidates,
+        mbr_num_reference_candidates=mbr_num_reference_candidates,
     )
