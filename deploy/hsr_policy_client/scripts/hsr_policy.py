@@ -1,5 +1,6 @@
 #!/home/policy/.venv/bin/python3
 from collections import deque
+from concurrent import futures
 
 import os
 import re
@@ -395,6 +396,49 @@ def _linear_upsample_actions(
     y = np.concatenate([actions, actions[-1:, :]], axis=0)
     xq = np.arange(out_steps, dtype=np.float32) / float(out_hz)
     return _linear_interpolate(x, y, xq).astype(np.float32, copy=False)
+
+
+def _make_policy_input_from_obs(obs: dict[str, Any], *, copy_arrays: bool) -> Optional[dict[str, Any]]:
+    required_keys = ("head_rgb", "hand_rgb", "joint_state", "instruction")
+    if any(key not in obs for key in required_keys):
+        return None
+
+    def _maybe_copy_array(value: Any) -> np.ndarray:
+        return np.array(value, copy=copy_arrays)
+
+    return {
+        "head_rgb": _maybe_copy_array(obs["head_rgb"]),
+        "hand_rgb": _maybe_copy_array(obs["hand_rgb"]),
+        "state": _maybe_copy_array(obs["joint_state"]),
+        "prompt": str(obs["instruction"]),
+    }
+
+
+def _blend_action_sequences(old_actions: np.ndarray, new_actions: np.ndarray, *, overlap_steps: int) -> np.ndarray:
+    old_actions = np.asarray(old_actions, dtype=np.float32)
+    new_actions = np.asarray(new_actions, dtype=np.float32)
+    if old_actions.ndim != 2 or new_actions.ndim != 2:
+        raise ValueError("old_actions and new_actions must both be 2D (T, D).")
+    if old_actions.shape[1] != new_actions.shape[1]:
+        raise ValueError(
+            "old_actions and new_actions must have matching action dimensions, "
+            f"got {old_actions.shape[1]} vs {new_actions.shape[1]}"
+        )
+    if old_actions.shape[0] == 0:
+        return new_actions
+    if new_actions.shape[0] == 0:
+        return old_actions
+
+    overlap = min(max(int(overlap_steps), 0), old_actions.shape[0], new_actions.shape[0])
+    if overlap == 0:
+        return new_actions
+
+    blended = np.empty((overlap, old_actions.shape[1]), dtype=np.float32)
+    for i in range(overlap):
+        alpha = float(i + 1) / float(overlap + 1)
+        blended[i] = ((1.0 - alpha) * old_actions[i] + alpha * new_actions[i]).astype(np.float32, copy=False)
+
+    return np.concatenate([blended, new_actions[overlap:]], axis=0).astype(np.float32, copy=False)
 
 
 class ActionSmoother:
@@ -812,10 +856,16 @@ class OpenpiPolicy:
         upsample: bool = False,
         upsample_hz: int = 50,
         upsample_method: str = UPSAMPLE_METHOD_SPLINE,
+        enable_async_replan: bool = False,
+        replan_after_chunks: int = 1,
+        blend_overlap_chunks: int = 1,
         action_mode: str = ACTION_MODE_AUTO,
         fallback_config_name: Optional[str] = None,
     ):
         self.logger = rospy
+        self._policy_server_host = policy_server_host
+        self._policy_server_port = policy_server_port
+        self._policy_server_api_key = policy_server_api_key
         self.requested_action_mode = action_mode
         self.fallback_config_name = fallback_config_name
         self.server_metadata: dict[str, Any] = {}
@@ -893,6 +943,9 @@ class OpenpiPolicy:
         self.action_hz: int = action_hz
         self.upsample: bool = upsample
         self.upsample_hz: int = upsample_hz
+        self.enable_async_replan: bool = bool(enable_async_replan)
+        self.replan_after_chunks: int = max(int(replan_after_chunks), 1)
+        self.blend_overlap_chunks: int = max(int(blend_overlap_chunks), 1)
         self.upsample_method: str = str(upsample_method)
         if self.upsample_method not in UPSAMPLE_METHODS:
             rospy.logwarn(
@@ -913,11 +966,180 @@ class OpenpiPolicy:
         self.action_queue: deque = deque(maxlen=self.execution_action_chunks)
         self._last_original_action_chunk: Optional[np.ndarray] = None
         self._infer_latencies_s: list[float] = []
+        self._replan_latencies_s: list[float] = []
+        self._latest_policy_input: Optional[dict[str, Any]] = None
+        self._prefetched_raw_action_chunk: Optional[np.ndarray] = None
+        self._plan_generation = 0
+        self._execution_steps_emitted = 0
+        self._replan_executor: Optional[futures.ThreadPoolExecutor] = None
+        self._replan_policy: Optional[WebsocketClientPolicy] = None
+        self._pending_replan_future: Optional[futures.Future] = None
+        self._pending_replan_generation: Optional[int] = None
+        self._replan_submitted = 0
+        self._replan_applied = 0
+        self._replan_prefetched = 0
+        self._replan_discarded = 0
+        self._replan_failed = 0
+
+        if self.enable_async_replan and self.adopted_action_chunks <= 1:
+            rospy.logwarn(
+                "Async replanning requires adopted_action_chunks > 1. Disabling async replanning."
+            )
+            self.enable_async_replan = False
+
+        if self.enable_async_replan and self.replan_after_chunks >= self.adopted_action_chunks:
+            clamped = max(self.adopted_action_chunks - 1, 1)
+            if clamped == self.replan_after_chunks:
+                rospy.logwarn(
+                    "Async replanning trigger is not before the end of the chunk. Disabling async replanning."
+                )
+                self.enable_async_replan = False
+            else:
+                rospy.logwarn(
+                    "replan_after_chunks=%s must be smaller than adopted_action_chunks=%s. "
+                    "Clamping to %s.",
+                    self.replan_after_chunks,
+                    self.adopted_action_chunks,
+                    clamped,
+                )
+                self.replan_after_chunks = clamped
+
+        self._replan_trigger_exec_steps: Optional[int] = None
+        self._blend_overlap_exec_steps: Optional[int] = None
+        if self.enable_async_replan:
+            self._replan_trigger_exec_steps = max(
+                int(round(self.replan_after_chunks * float(self.execution_action_chunks) / float(self.adopted_action_chunks))),
+                1,
+            )
+            self._blend_overlap_exec_steps = max(
+                int(round(self.blend_overlap_chunks * float(self.execution_action_chunks) / float(self.adopted_action_chunks))),
+                1,
+            )
+            self._replan_executor = futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="hsr_policy_replan")
+            rospy.loginfo(
+                "Async replanning enabled: replan_after_chunks=%s (~%s exec steps), "
+                "blend_overlap_chunks=%s (~%s exec steps)",
+                self.replan_after_chunks,
+                self._replan_trigger_exec_steps,
+                self.blend_overlap_chunks,
+                self._blend_overlap_exec_steps,
+            )
 
     def _record_infer_timing(self, *, start_s: float, end_s: float) -> None:
         latency = float(end_s - start_s)
         if latency >= 0:
             self._infer_latencies_s.append(latency)
+
+    def _record_replan_timing(self, *, latency_s: float) -> None:
+        latency = float(latency_s)
+        if latency >= 0:
+            self._replan_latencies_s.append(latency)
+
+    def _prepare_execution_chunk(self, raw_action_chunk: np.ndarray) -> np.ndarray:
+        action_chunk = np.asarray(raw_action_chunk[: self.adopted_action_chunks], dtype=np.float32)
+        if not self.upsample:
+            return action_chunk
+        if self.upsample_method == UPSAMPLE_METHOD_LINEAR:
+            return _linear_upsample_actions(
+                action_chunk,
+                in_hz=self.action_hz,
+                out_hz=self.upsample_hz,
+                out_steps=self.execution_action_chunks,
+            )
+        return _cubic_spline_upsample_actions(
+            action_chunk,
+            in_hz=self.action_hz,
+            out_hz=self.upsample_hz,
+            out_steps=self.execution_action_chunks,
+        )
+
+    def _install_new_plan(self, raw_action_chunk: np.ndarray) -> np.ndarray:
+        raw_action_chunk = np.asarray(raw_action_chunk, dtype=np.float32)
+        execution_chunk = self._prepare_execution_chunk(raw_action_chunk)
+        self._last_original_action_chunk = raw_action_chunk[: self.adopted_action_chunks]
+        self.action_queue = deque(execution_chunk[1:], maxlen=self.execution_action_chunks)
+        self._plan_generation += 1
+        self._execution_steps_emitted = 0
+        return execution_chunk
+
+    def _run_async_replan(self, policy_input: dict[str, Any]) -> tuple[np.ndarray, float]:
+        if self._replan_policy is None:
+            self._replan_policy = WebsocketClientPolicy(
+                host=self._policy_server_host,
+                port=self._policy_server_port,
+                api_key=self._policy_server_api_key,
+            )
+        start_s = time.perf_counter()
+        outputs = self._replan_policy.infer(policy_input)
+        end_s = time.perf_counter()
+        return np.asarray(outputs["actions"], dtype=np.float32), float(end_s - start_s)
+
+    def _refresh_latest_policy_input(self, obs: dict[str, Any]) -> None:
+        policy_input = _make_policy_input_from_obs(obs, copy_arrays=True)
+        if policy_input is not None:
+            self._latest_policy_input = policy_input
+
+    def _maybe_start_async_replan(self) -> None:
+        if not self.enable_async_replan or self._replan_executor is None:
+            return
+        if self._pending_replan_future is not None:
+            return
+        if self._latest_policy_input is None:
+            return
+        if len(self.action_queue) == 0:
+            return
+        if self._replan_trigger_exec_steps is None or self._execution_steps_emitted < self._replan_trigger_exec_steps:
+            return
+
+        policy_input = {
+            "head_rgb": np.array(self._latest_policy_input["head_rgb"], copy=True),
+            "hand_rgb": np.array(self._latest_policy_input["hand_rgb"], copy=True),
+            "state": np.array(self._latest_policy_input["state"], copy=True),
+            "prompt": str(self._latest_policy_input["prompt"]),
+        }
+        self._pending_replan_generation = self._plan_generation
+        self._pending_replan_future = self._replan_executor.submit(self._run_async_replan, policy_input)
+        self._replan_submitted += 1
+
+    def _maybe_collect_async_replan(self) -> None:
+        if self._pending_replan_future is None or not self._pending_replan_future.done():
+            return
+
+        future = self._pending_replan_future
+        source_generation = self._pending_replan_generation
+        self._pending_replan_future = None
+        self._pending_replan_generation = None
+
+        try:
+            raw_action_chunk, latency_s = future.result()
+        except Exception as e:
+            self._replan_failed += 1
+            rospy.logwarn("Async replanning failed: %s", e)
+            return
+
+        self._record_replan_timing(latency_s=latency_s)
+        if source_generation != self._plan_generation:
+            self._replan_discarded += 1
+            return
+
+        if len(self.action_queue) == 0:
+            self._prefetched_raw_action_chunk = np.asarray(raw_action_chunk, dtype=np.float32)
+            self._replan_prefetched += 1
+            return
+
+        new_execution_chunk = self._prepare_execution_chunk(raw_action_chunk)
+        overlap_steps = self._blend_overlap_exec_steps or 0
+        old_remaining = np.asarray(list(self.action_queue), dtype=np.float32)
+        merged_remaining = _blend_action_sequences(
+            old_remaining,
+            new_execution_chunk,
+            overlap_steps=overlap_steps,
+        )
+        self.action_queue = deque(merged_remaining, maxlen=self.execution_action_chunks)
+        self._last_original_action_chunk = np.asarray(raw_action_chunk[: self.adopted_action_chunks], dtype=np.float32)
+        self._plan_generation += 1
+        self._execution_steps_emitted = 0
+        self._replan_applied += 1
 
     def log_inference_stats(self) -> None:
         def _summarize(values: list[float]) -> tuple[int, float, float] | None:
@@ -927,18 +1149,36 @@ class OpenpiPolicy:
             return int(arr.size), float(arr.mean()), float(arr.var())
 
         lat = _summarize(self._infer_latencies_s)
+        replan_lat = _summarize(self._replan_latencies_s)
 
         if lat is None:
             rospy.loginfo("Inference stats: no inference calls recorded.")
-            return
+        else:
+            n_lat, mean_lat, var_lat = lat
+            rospy.loginfo(
+                "Inference latency (infer() only): n=%d mean=%.1fms var=%.3f(ms^2)",
+                n_lat,
+                mean_lat * 1e3,
+                var_lat * 1e6,
+            )
+        if replan_lat is not None:
+            n_replan, mean_replan, var_replan = replan_lat
+            rospy.loginfo(
+                "Async replan latency: n=%d mean=%.1fms var=%.3f(ms^2) submitted=%d applied=%d prefetched=%d discarded=%d failed=%d",
+                n_replan,
+                mean_replan * 1e3,
+                var_replan * 1e6,
+                self._replan_submitted,
+                self._replan_applied,
+                self._replan_prefetched,
+                self._replan_discarded,
+                self._replan_failed,
+            )
 
-        n_lat, mean_lat, var_lat = lat
-        rospy.loginfo(
-            "Inference latency (infer() only): n=%d mean=%.1fms var=%.3f(ms^2)",
-            n_lat,
-            mean_lat * 1e3,
-            var_lat * 1e6,
-        )
+    def shutdown(self) -> None:
+        if self._replan_executor is not None:
+            self._replan_executor.shutdown(wait=False, cancel_futures=True)
+            self._replan_executor = None
 
     def act(self, obs: dict[str, Any]) -> np.ndarray:
         """
@@ -967,49 +1207,32 @@ class OpenpiPolicy:
                 "base_t",
             ]
         """
-
+        self._refresh_latest_policy_input(obs)
+        self._maybe_collect_async_replan()
+        self._maybe_start_async_replan()
         if len(self.action_queue) > 0:
             action = self.action_queue.popleft()
+            self._execution_steps_emitted += 1
             return _convert_model_action_to_command(
                 action,
                 obs["joint_state"],
                 self.action_mode,
                 logger=self.logger,
             )
-        # Build input dictionary for policy inference.
-        policy_input = {
-            "head_rgb": obs["head_rgb"],
-            "hand_rgb": obs["hand_rgb"],
-            "state": obs["joint_state"],
-            "prompt": obs["instruction"],
-        }
-        infer_start_s = time.perf_counter()
-        raw_action_chunk = np.asarray(self.policy.infer(policy_input)["actions"], dtype=np.float32)
-        infer_end_s = time.perf_counter()
-        self._record_infer_timing(start_s=infer_start_s, end_s=infer_end_s)
-        self._last_original_action_chunk = raw_action_chunk[: self.adopted_action_chunks]
+        raw_action_chunk = self._prefetched_raw_action_chunk
+        self._prefetched_raw_action_chunk = None
+        if raw_action_chunk is None:
+            policy_input = _make_policy_input_from_obs(obs, copy_arrays=False)
+            if policy_input is None:
+                raise ValueError("Full observation is required when the action queue is empty.")
+            infer_start_s = time.perf_counter()
+            raw_action_chunk = np.asarray(self.policy.infer(policy_input)["actions"], dtype=np.float32)
+            infer_end_s = time.perf_counter()
+            self._record_infer_timing(start_s=infer_start_s, end_s=infer_end_s)
 
-        if self.upsample:
-            action_chunk = raw_action_chunk[: self.adopted_action_chunks]
-            if self.upsample_method == UPSAMPLE_METHOD_LINEAR:
-                action_chunk = _linear_upsample_actions(
-                    action_chunk,
-                    in_hz=self.action_hz,
-                    out_hz=self.upsample_hz,
-                    out_steps=self.execution_action_chunks,
-                )
-            else:
-                action_chunk = _cubic_spline_upsample_actions(
-                    action_chunk,
-                    in_hz=self.action_hz,
-                    out_hz=self.upsample_hz,
-                    out_steps=self.execution_action_chunks,
-                )
-        else:
-            action_chunk = raw_action_chunk[: self.adopted_action_chunks]
-
-        self.action_queue.extend(action_chunk[1:])
-        action = action_chunk[0]  # Return only the first action now; queue the rest.
+        action_chunk = self._install_new_plan(raw_action_chunk)
+        action = action_chunk[0]
+        self._execution_steps_emitted += 1
 
         return _convert_model_action_to_command(
             action,
@@ -1230,6 +1453,9 @@ def main():
     upsample: bool = rospy.get_param("~upsample", False)
     upsample_hz: int = rospy.get_param("~upsample_hz", 50)
     upsample_method: str = rospy.get_param("~upsample_method", UPSAMPLE_METHOD_SPLINE)
+    enable_async_replan: bool = _param_to_bool(rospy.get_param("~enable_async_replan", False))
+    replan_after_chunks: int = int(rospy.get_param("~replan_after_chunks", 1))
+    blend_overlap_chunks: int = int(rospy.get_param("~blend_overlap_chunks", 1))
     action_mode: str = rospy.get_param("~action_mode", ACTION_MODE_AUTO)
     execution_freq: int = upsample_hz if upsample else update_freq
 
@@ -1264,6 +1490,9 @@ def main():
     rospy.loginfo("upsample: %s", upsample)
     rospy.loginfo("upsample_hz: %s", upsample_hz)
     rospy.loginfo("upsample_method: %s", upsample_method)
+    rospy.loginfo("enable_async_replan: %s", enable_async_replan)
+    rospy.loginfo("replan_after_chunks: %s", replan_after_chunks)
+    rospy.loginfo("blend_overlap_chunks: %s", blend_overlap_chunks)
     rospy.loginfo("action_mode: %s", action_mode)
     rospy.loginfo("action_smoothing: %s", action_smoothing)
     rospy.loginfo("ema_alpha: %s", ema_alpha)
@@ -1292,6 +1521,9 @@ def main():
         upsample=upsample,
         upsample_hz=upsample_hz,
         upsample_method=upsample_method,
+        enable_async_replan=enable_async_replan,
+        replan_after_chunks=replan_after_chunks,
+        blend_overlap_chunks=blend_overlap_chunks,
         action_mode=action_mode,
         fallback_config_name=config_name,
     )
@@ -1315,6 +1547,7 @@ def main():
     )
     rospy.on_shutdown(recorder.save_and_plot)
     rospy.on_shutdown(policy.log_inference_stats)
+    rospy.on_shutdown(policy.shutdown)
 
     log_interval = 1
     if upsample and update_freq > 0:
