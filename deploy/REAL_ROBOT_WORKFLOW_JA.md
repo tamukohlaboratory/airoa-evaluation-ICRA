@@ -77,11 +77,53 @@ roslaunch hsr_policy_client hsr_policy_client.launch \
   action_mode:=state_diff_arm_head_relative_gripper_base \
   instruction:='From a rectangle by relocating the mug that is not at a rectangle corner 3' 
 
-  
+roslaunch hsr_policy_client hsr_policy_client.launch \
+  test_mode:=false \
+  action_mode:=state_diff_arm_head_relative_gripper_base \
+  instruction:='place the mug at the missing rectangle corner' 
+
 roslaunch hsr_policy_client hsr_policy_client.launch \
   test_mode:=false \
   action_mode:=state_diff_arm_head_relative_gripper_base \
   instruction:='pick up the coffee bottle on the right' 
+```
+
+## change the robot state
+```bash
+ssh administrator@192.168.0.2
+# password
+
+docker exec -it docker.hsrb.robot.service bash
+source /ros_entrypoint.sh
+ihsrb
+```
+From a rectangle by relocating the mug that is not at a rectangle corner 3
+```bash
+whole_body.move_to_joint_positions(
+   {
+      "arm_flex_joint": -0.26,
+      "arm_lift_joint": 0.0,
+      "arm_roll_joint": 0.0,
+      "wrist_flex_joint": -1.57,
+      "wrist_roll_joint": 0.0,
+      "head_pan_joint": 0.0,
+      "head_tilt_joint": -0.47
+   }
+)
+```
+pick up the coffee bottle on the right
+```bash
+whole_body.move_to_joint_positions(
+   {
+      "arm_flex_joint": 0.0,
+      "arm_lift_joint": 0.2,
+      "arm_roll_joint": 0.0,
+      "wrist_flex_joint": -1.57,
+      "wrist_roll_joint": 0.0,
+      "head_pan_joint": 0.0,
+      "head_tilt_joint": -0.47
+   }
+)
 ```
 
 今の launch default は保守寄りです．
