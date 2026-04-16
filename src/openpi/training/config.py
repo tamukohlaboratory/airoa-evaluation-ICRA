@@ -1518,7 +1518,69 @@ _CONFIGS = [
             ],
         },
     ),
-
+    # "0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_all_0415"
+    TrainConfig(
+        name="0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotHSRDataConfig(
+            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0404/step25_balance_3/train_dataset",
+            assets=AssetsConfig(
+                assets_dir="./assets/airoa_hsr_shared",
+                asset_id="pi05_airoa_hsr_lora_horizon8_state_diff_arm_head_relative_gripper_base_gripperTrue",
+            ),
+            convert_gripper=True,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                use_quantile_norm=False,
+            ),
+            action_mode="state_diff_arm_head_relative_gripper_base",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=100_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=32,
+        num_workers=0,
+        prefetch_factor=1,
+        num_train_steps=80_000,
+        save_interval=2_000,
+        policy_metadata={
+            "robot": "toyota_hsr",
+            "adapter": "fullfinetuning",
+            "state_names": [
+                "arm_lift_joint",
+                "arm_flex_joint",
+                "arm_roll_joint",
+                "wrist_flex_joint",
+                "wrist_roll_joint",
+                "gripper",
+                "head_pan_joint",
+                "head_tilt_joint",
+            ],
+            "action_names": [
+                "arm_lift_joint",
+                "arm_flex_joint",
+                "arm_roll_joint",
+                "wrist_flex_joint",
+                "wrist_roll_joint",
+                "gripper",
+                "head_pan_joint",
+                "head_tilt_joint",
+                "base_x",
+                "base_y",
+                "base_theta",
+            ],
+        },
+    ),
     # "0412_pi05_airoa_hsr_lora_statediff_horizon8_all"
     TrainConfig(
         name="0412_pi05_airoa_hsr_lora_statediff_horizon8_all",

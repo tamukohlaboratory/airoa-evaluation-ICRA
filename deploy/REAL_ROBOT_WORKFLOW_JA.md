@@ -7,34 +7,17 @@
 リポジトリへ移動して，checkpoint と port をセットして server を起動します．
 
 ```bash
-cd ~/usr/icra_vla_ws/airoa-evaluation-ICRA-ROS1
-
-export POLICY_CHECKPOINT_PATH=/abs/path/to/checkpoint_dir/
-# export POLICY_CHECKPOINT_PATH=/media/hma/TeruSSD/checkpoints/0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_relocate/0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_relocate/5000
-export POLICY_CONFIG_NAME=config_name
-# export POLICY_CONFIG_NAME=0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_relocate
+cp -p -r 0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all/25000/ 
+git clone https://github.com/tamukohlaboratory/airoa-evaluation-ICRA
+cd airoa-evaluation-ICRA
+export POLICY_CHECKPOINT_PATH=/abs/path/to/0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all/25000/
+export POLICY_CONFIG_NAME=0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all
 export POLICY_SERVER_PORT=8000
-```
-```
-export POLICY_CONFIG_NAME=0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_relocate/
-export POLICY_CHECKPOINT_PATH=/home/bitell/Devenv/ICRA/0413_noon/0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_relocate/15000
-export POLICY_SERVER_PORT=8000
-
-sudo -E ./RUN-DOCKER-CONTAINER.sh up
-```
-
-*[server/entry_point.sh](../server/entrypoint.sh)*のPOLICY_CONFIG_NAMEを修正する
-※ ROS1版はここを修正しないとサーバー側のPOLICY_CONFIG_NAMEが書き換わらない
-```shell
-POLICY_CONFIG_NAME="${POLICY_CONFIG_NAME:-pi0_hsr_airoa-moma}"
-↓
-POLICY_CONFIG_NAME="${POLICY_CONFIG_NAME:-0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_relocate}"
 ```
 
 `POLICY_CONFIG_NAME` は checkpoint を学習したときの config 名と一致させてください．
 server はこの config から `action_mode` を metadata として配信し，client はそれを使って arm/head の action 解釈を切り替えます．
 ここがずれると `absolute` や `state_diff` の deploy が崩れます．
-
 
 ## 2. 制御PCですること
 
@@ -107,3 +90,9 @@ roslaunch hsr_policy_client hsr_policy_client.launch \
 server metadata が取れない古い構成を使う場合だけ，必要に応じて
 `action_mode:=relative` / `action_mode:=absolute_arm_head_relative_gripper_base` /
 `action_mode:=state_diff_arm_head_relative_gripper_base` を明示してください．
+右のコーヒーをとってください
+
+roslaunch hsr_policy_client hsr_policy_client.launch \
+  test_mode:=false \
+  action_mode:=state_diff_arm_head_relative_gripper_base \
+  instruction:="右のコーヒーをとってください"
