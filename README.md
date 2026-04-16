@@ -1,15 +1,16 @@
 # airoa-evaluation-ICRA
 
-## Reproduction / Inference
+## To the person responsible for AIROA deployment
+### Reproduction / Inference
+
 First, You need to confirm the checkpoint is under the airoa-evaluation-ICRA directory.
 
 ```bash
-export POLICY_CHECKPOINT_PATH=0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_all_0414/25000/
-export POLICY_PYTORCH_DEVICE=cuda
-export POLICY_CONFIG_NAME=0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_all
-./RUN-DOCKER-CONTAINER.sh up
-./RUN-DOCKER-CONTAINER.sh shell
-roslaunch hsr_policy_client hsr_policy_client.launch
+git clone https://github.com/tamukohlaboratory/airoa-evaluation-ICRA
+cd airoa-evaluation-ICRA
+export POLICY_CHECKPOINT_PATH=/abs/path/to/0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all/25000/
+export POLICY_CONFIG_NAME=0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all
+export POLICY_SERVER_PORT=8000
 ```
 
 
