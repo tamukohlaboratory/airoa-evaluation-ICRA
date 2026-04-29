@@ -862,6 +862,7 @@ class TrainConfig:
         self.action_loss.validate(self.model.action_dim)
 
 
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     ###############################################
@@ -2094,71 +2095,6 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
-    # "AIRoA_baseline"
-    TrainConfig(
-        name="AIRoA_baseline",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=16,
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0404/step25_balance_3/train_dataset",
-            assets=AssetsConfig(
-                assets_dir="/home/bitell/Devenv/ICRA/baseline/100000/assets/lerobot_datasets/",
-                asset_id="task6891011_level12_v2.5_train",
-            ),
-            # /home/bitell/Devenv/ICRA/baseline/100000/assets/lerobot_datasets/task6891011_level12_v2.5_train/norm_stats.json
-            convert_gripper=True,
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=False,
-            ),
-            action_mode="state_diff_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=5e-5,
-            decay_steps=100_000,
-            decay_lr=5e-6,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        batch_size=32,
-        num_workers=0,
-        prefetch_factor=1,
-        num_train_steps=80_000,
-        save_interval=2_000,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "fullfinetuning",
-            "state_names": [
-                "arm_lift_joint",
-                "arm_flex_joint",
-                "arm_roll_joint",
-                "wrist_flex_joint",
-                "wrist_roll_joint",
-                "gripper",
-                "head_pan_joint",
-                "head_tilt_joint",
-            ],
-            "action_names": [
-                "arm_lift_joint",
-                "arm_flex_joint",
-                "arm_roll_joint",
-                "wrist_flex_joint",
-                "wrist_roll_joint",
-                "gripper",
-                "head_pan_joint",
-                "head_tilt_joint",
-                "base_x",
-                "base_y",
-                "base_theta",
-            ],
-        },
-    ),
-
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     # *polaris_config.get_polaris_configs(),

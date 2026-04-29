@@ -4,6 +4,7 @@ import pathlib
 from typing import Any
 
 import jax.numpy as jnp
+import numpy as np
 
 import openpi.models.model as _model
 import openpi.policies.policy as _policy
@@ -43,6 +44,11 @@ def create_trained_policy(
         presence of "model.safensors" in the checkpoint directory.
     """
     repack_transforms = repack_transforms or transforms.Group()
+    sample_kwargs = dict(sample_kwargs or {})
+    if train_config.action_loss.masks_actions_and_noise:
+        action_sample_mask = train_config.action_loss.build_valid_mask(train_config.model.action_dim)
+        if action_sample_mask is not None:
+            sample_kwargs.setdefault("action_sample_mask", np.asarray(action_sample_mask, dtype=np.float32))
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
 
     # Check if this is a PyTorch model by looking for model.safetensors

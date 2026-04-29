@@ -8,7 +8,9 @@ from typing import Protocol
 
 from etils import epath
 import jax
+from jax.experimental import multihost_utils as multihost_utils
 import orbax.checkpoint as ocp
+from orbax.checkpoint import checkpoint_utils
 import orbax.checkpoint.future as future
 
 from openpi.shared import array_typing as at
@@ -17,25 +19,36 @@ import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
 
 
+def _multihost_barrier(name: str) -> None:
+    if jax.process_count() > 1:
+        multihost_utils.sync_global_devices(name)
+
+
+
 def initialize_checkpoint_dir(
     checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
 ) -> tuple[ocp.CheckpointManager, bool]:
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
-    if checkpoint_dir.exists():
-        if overwrite:
-            checkpoint_dir.rmtree()
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
-        elif resume:
-            resuming = True
-        else:
-            raise FileExistsError(
-                f"Checkpoint directory {checkpoint_dir} already exists. Use --overwrite or --resume "
-                "to indicate how to handle it."
-            )
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if jax.process_index() == 0:
+        if checkpoint_dir.exists():
+            if overwrite:
+                checkpoint_dir.rmtree()
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
+            elif resume:
+                resuming = True
+            else:
+                raise FileExistsError(
+                    f"Checkpoint directory {checkpoint_dir} already exists. Use --overwrite or --resume "
+                    "to indicate how to handle it."
+                )
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    _multihost_barrier("checkpoint_dir_ready")
+    if jax.process_index() != 0 and checkpoint_dir.exists() and resume and not overwrite:
+        resuming = True
 
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
@@ -59,6 +72,7 @@ def initialize_checkpoint_dir(
         logging.info("Checkpoint directory exists, but does not contain any checkpoints. Aborting resume.")
         resuming = False
 
+    _multihost_barrier("checkpoint_manager_initialized")
     return mngr, resuming
 
 
@@ -86,9 +100,29 @@ def save_state(
     checkpoint_manager.save(step, items)
 
 
+#def restore_state(
+#    checkpoint_manager: ocp.CheckpointManager,
+#    state: training_utils.TrainState,
+#    data_loader: _data_loader.DataLoader,
+#    step: int | None = None,
+#) -> training_utils.TrainState:
+#    del data_loader
+#
+#    with at.disable_typechecking():
+#        # Split params that can be used for inference into a separate item.
+#        train_state, params = _split_params(state)
+#        restored = checkpoint_manager.restore(
+#            step,
+#            items={
+#                "train_state": train_state,
+#                "params": {"params": params},
+#            },
+#        )
+#    return _merge_params(restored["train_state"], restored["params"])
 def restore_state(
     checkpoint_manager: ocp.CheckpointManager,
     state: training_utils.TrainState,
+    state_sharding,
     data_loader: _data_loader.DataLoader,
     step: int | None = None,
 ) -> training_utils.TrainState:
@@ -97,15 +131,31 @@ def restore_state(
     with at.disable_typechecking():
         # Split params that can be used for inference into a separate item.
         train_state, params = _split_params(state)
+        train_state_sharding, params_sharding = _split_params(state_sharding)
+
         restored = checkpoint_manager.restore(
             step,
             items={
                 "train_state": train_state,
                 "params": {"params": params},
             },
+            restore_kwargs={
+                "train_state": {
+                    "restore_args": checkpoint_utils.construct_restore_args(
+                        train_state,
+                        train_state_sharding,
+                    )
+                },
+                "params": {
+                    "restore_args": checkpoint_utils.construct_restore_args(
+                        {"params": params},
+                        {"params": params_sharding},
+                    )
+                },
+            },
         )
-    return _merge_params(restored["train_state"], restored["params"])
 
+    return _merge_params(restored["train_state"], restored["params"])
 
 def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:
     norm_stats_dir = epath.Path(assets_dir) / asset_id
@@ -119,14 +169,22 @@ class Callback(Protocol):
 
 
 class CallbackHandler(ocp.AsyncCheckpointHandler):
-    """A CheckpointHandler for calling an arbitrary function asynchronously. Only for saving, not for restoring."""
+    """A CheckpointHandler for calling an arbitrary function asynchronously. Only for saving, not for restoring.
+
+    Orbax 0.11.1 does not re-export ``CommitFutureAwaitingContractedSignals`` from
+    ``orbax.checkpoint.future`` at the public module level. Because this callback only
+    writes tiny asset metadata (norm stats), we keep the implementation simple and
+    version-robust: perform the save eagerly during ``async_save`` and return a
+    ``NoopFuture``.
+    """
 
     def save(self, directory: epath.Path, args: CallbackSave):
         if jax.process_index() == 0:
             args.callback(directory)
 
     async def async_save(self, directory: epath.Path, args: CallbackSave) -> list[futures.Future]:
-        return [future.CommitFutureAwaitingContractedSignals(asyncio.to_thread(self.save, directory, args))]
+        await asyncio.to_thread(self.save, directory, args)
+        return [future.NoopFuture()]
 
     def restore(self, *args, **kwargs):
         raise NotImplementedError("CallbackHandler does not support restore")
