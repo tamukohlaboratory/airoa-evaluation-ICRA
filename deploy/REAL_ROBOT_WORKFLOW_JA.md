@@ -14,6 +14,11 @@ export POLICY_CHECKPOINT_PATH=/abs/path/to/checkpoint_dir/
 export POLICY_CONFIG_NAME=config_name
 # export POLICY_CONFIG_NAME=0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_relocate
 export POLICY_SERVER_PORT=8000
+
+# checkpoint path または POLICY_CONFIG_NAME に mask が含まれる場合、sample mask は自動で有効化される
+# 名前に mask が含まれない masked checkpoint の場合だけ手動で有効化する
+# export POLICY_ENABLE_ACTION_SAMPLE_MASK=true
+# export POLICY_ACTION_SAMPLE_MASK_VALID_DIMS=0,1,2,3,4,6,11,12,13,14,15
 ```
 ```
 export POLICY_CONFIG_NAME=0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_relocate/
