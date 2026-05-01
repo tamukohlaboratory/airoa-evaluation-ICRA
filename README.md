@@ -15,7 +15,7 @@ export POLICY_CONFIG_NAME="0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon1
 ./RUN-DOCKER-CONTAINER.sh up
 ./RUN-DOCKER-CONTAINER.sh shell
 roslaunch hsr_policy_client hsr_policy_client.launch
-# for inference you need to provide action_mode 
+# Example : for inference you need to provide action_mode 
 roslaunch hsr_policy_client hsr_policy_client.launch \
   test_mode:=false \
   action_mode:=state_diff_arm_head_relative_gripper_base \
