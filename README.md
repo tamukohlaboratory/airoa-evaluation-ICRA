@@ -2,23 +2,24 @@
 
 ## To the person responsible for AIROA deployment
 ### Design choices
+Please deploy the model by passing the action_mode argument when running ros launch, so that action_mode is explicitly specified during model inference.
 
-We use `action_mode=absolute` in our final submission. Among the action parameterizations we tested, the absolute formulation achieved the lowest training loss, so we selected it as our final setting.
-During local verification, we found that the original deployment-side `hsr_policy.py` did not fully support absolute-style execution out of the box. In particular, modes such as `absolute_arm_head_relative_gripper_base` are not handled correctly by the original `act()` implementation, because the arm/head commands are always applied additively to the current state.
-To make inference consistent with training, we modified the action restoration/execution logic in `act()` to branch based on the action mode. When the mode is `absolute`, the predicted action is used directly. Relative components, when present, continue to follow the original relative update rule.
-
-We verified this implementation locally before submission.
-
+Thank you.
 ### Reproduction / Inference
 First, You need to confirm the checkpoint is under the airoa-evaluation-ICRA directory.
 
 ```bash
-export POLICY_CHECKPOINT_PATH=./pi05_hsr_lora_horizon8_absolute_GTrue_curated_relocate/8000
+export POLICY_CHECKPOINT_PATH="./submission_0501/20000"
 export POLICY_PYTORCH_DEVICE=cuda
-export POLICY_CONFIG_NAME=pi05_hsr_lora_horizon8_absolute_GTrue_curated_relocate
+export POLICY_CONFIG_NAME="0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all"
 ./RUN-DOCKER-CONTAINER.sh up
 ./RUN-DOCKER-CONTAINER.sh shell
 roslaunch hsr_policy_client hsr_policy_client.launch
+# for inference you need to provide action_mode 
+roslaunch hsr_policy_client hsr_policy_client.launch \
+  test_mode:=false \
+  action_mode:=state_diff_arm_head_relative_gripper_base \
+  instruction:='pick up the coffee bottle on the right' 
 ```
 
 
