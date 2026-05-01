@@ -6,6 +6,7 @@ Please deploy the model by passing the action_mode argument when running ros lau
 
 Thank you.
 ### Reproduction / Inference
+
 First, You need to confirm the checkpoint is under the airoa-evaluation-ICRA directory.
 
 ```bash
