@@ -98,3 +98,4 @@ def test_pi05_action_policy_lora_trainable_filter():
         not ("PaliGemma/llm" in path and "_1" not in path and "lora" not in path)
         for path in paths
     )
+

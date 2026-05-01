@@ -13,6 +13,11 @@ cd airoa-evaluation-ICRA
 export POLICY_CHECKPOINT_PATH=/abs/path/to/0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all/25000/
 export POLICY_CONFIG_NAME=0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all
 export POLICY_SERVER_PORT=8000
+
+# checkpoint path または POLICY_CONFIG_NAME に mask が含まれる場合、sample mask は自動で有効化される
+# 名前に mask が含まれない masked checkpoint の場合だけ手動で有効化する
+# export POLICY_ENABLE_ACTION_SAMPLE_MASK=true
+# export POLICY_ACTION_SAMPLE_MASK_VALID_DIMS=0,1,2,3,4,6,11,12,13,14,15
 ```
 
 `POLICY_CONFIG_NAME` は checkpoint を学習したときの config 名と一致させてください．

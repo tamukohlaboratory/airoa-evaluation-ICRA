@@ -24,6 +24,7 @@ import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
@@ -102,6 +103,7 @@ class DataConfig:
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
+    # Path to the data filter file for DROID dataset
     filter_dict_path: str | None = None
 
 class GroupFactory(Protocol):
@@ -237,6 +239,58 @@ class SimpleDataConfig(DataConfigFactory):
             data_transforms=self.data_transforms(model_config),
             model_transforms=self.model_transforms(model_config),
         )
+@dataclasses.dataclass(frozen=True)
+class LeRobotAlohaDataConfig(DataConfigFactory):
+    # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
+    # Gripper dimensions will remain in absolute values.
+    use_delta_joint_actions: bool = True
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+    # If true, this will convert the joint and gripper values from the standard Aloha space to
+    # the space used by the pi internal runtime which was used to train the base model. People who
+    # use standard Aloha data should set this to true.
+    adapt_to_pi: bool = True
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {"cam_high": "observation.images.top"},
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
+            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotAlohaDataConfig(DataConfigFactory):
@@ -367,18 +421,29 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
-@dataclasses.dataclass(frozen=True)
-class RLDSDroidDataConfig(DataConfigFactory):
-    """
-    Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
-    """
 
-    rlds_data_dir: str | None = None
-    action_space: droid_rlds_dataset.DroidActionSpace | None = None
+# @dataclasses.dataclass(frozen=True)
+# class RLDSDroidDataConfig(DataConfigFactory):
+#     """
+#     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
+#     """
 
-    # Filtering options. Can pass a path to a dictionary that maps episodes to timestep ranges
-    # to tuples denoting ranges of time steps to keep (start, end). Episodes are uniquely identified with
-    # f"{recording_folderpath}--{file_path}", both of which are present in the RLDS episode metadata.
+#     rlds_data_dir: str | None = None
+#     action_space: droid_rlds_dataset.DroidActionSpace | None = None
+
+#     # Filtering options. Can pass a path to a dictionary that maps episodes to timestep ranges
+#     # to tuples denoting ranges of time steps to keep (start, end). Episodes are uniquely identified with
+#     # f"{recording_folderpath}--{file_path}", both of which are present in the RLDS episode metadata.
+
+#     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
+#     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = (
+#         droid_rlds_dataset.RLDSDataset(
+#             name="droid",
+#             version="1.0.1",
+#             weight=1.0,
+#             filter_dict_path="gs://openpi-assets/droid/droid_sample_ranges_v1_0_1.json",
+#         ),
+#     )
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -601,6 +666,102 @@ class LeRobotHSRDataConfig(DataConfigFactory):
         )
 
 
+
+HSR_VALID_ACTION_DIMS: tuple[int, ...] = (0, 1, 2, 3, 4, 6, 11, 12, 13, 14, 15)
+
+
+@dataclasses.dataclass(frozen=True)
+class ActionLossConfig:
+    """Controls optional action-dimension masking and weighting for flow-matching action loss.
+
+    Modes:
+      default:
+        Original behavior. Mean MSE over all model action dimensions.
+      valid_action_only:
+        Compute the loss only on valid robot action dimensions. Padding/unused dimensions get weight 0.
+      valid_action_lift_weighted:
+        Same as valid_action_only, but upweights the arm_lift_joint action dimension.
+      valid_action_lift_weighted_masked:
+        Same as valid_action_lift_weighted, and additionally masks actions/noise/x_t/u_t during training.
+        Policy creation also passes the valid-action mask to sampling, so unused dimensions stay zero during denoising.
+    """
+
+    mode: Literal[
+        "default",
+        "valid_action_only",
+        "valid_action_lift_weighted",
+        "valid_action_lift_weighted_masked",
+    ] = "default"
+
+    # HSR 32-dim padded action layout used by state_diff_arm_head_relative_gripper_base:
+    #   0 arm_lift_joint, 1 arm_flex_joint, 2 arm_roll_joint, 3 wrist_flex_joint, 4 wrist_roll_joint,
+    #   6 gripper, 11 head_pan_joint, 12 head_tilt_joint, 13 base_x, 14 base_y, 15 base_theta.
+    valid_action_dims: tuple[int, ...] = HSR_VALID_ACTION_DIMS
+    lift_action_dim: int = 0
+    lift_weight: float = 5.0
+
+    @property
+    def uses_valid_action_loss(self) -> bool:
+        return self.mode != "default"
+
+    @property
+    def uses_lift_weight(self) -> bool:
+        return self.mode in {"valid_action_lift_weighted", "valid_action_lift_weighted_masked"}
+
+    @property
+    def masks_actions_and_noise(self) -> bool:
+        return self.mode == "valid_action_lift_weighted_masked"
+
+    def validate(self, action_dim: int) -> None:
+        valid_modes = {
+            "default",
+            "valid_action_only",
+            "valid_action_lift_weighted",
+            "valid_action_lift_weighted_masked",
+        }
+        if self.mode not in valid_modes:
+            raise ValueError(f"Unknown action loss mode: {self.mode!r}. Expected one of {sorted(valid_modes)}.")
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be positive, got {action_dim}.")
+        if self.lift_weight <= 0:
+            raise ValueError(f"lift_weight must be positive, got {self.lift_weight}.")
+        if self.mode == "default":
+            return
+        if not self.valid_action_dims:
+            raise ValueError("valid_action_dims must not be empty when action loss masking is enabled.")
+        invalid_dims = sorted({int(d) for d in self.valid_action_dims if int(d) < 0 or int(d) >= action_dim})
+        if invalid_dims:
+            raise ValueError(
+                f"valid_action_dims contains indices outside action_dim={action_dim}: {invalid_dims}."
+            )
+        if self.uses_lift_weight and self.lift_action_dim not in self.valid_action_dims:
+            raise ValueError(
+                f"lift_action_dim={self.lift_action_dim} must be included in valid_action_dims "
+                "when lift weighting is enabled."
+            )
+
+    def build_loss_weights(self, action_dim: int) -> tuple[float, ...] | None:
+        """Returns per-action-dimension loss weights, or None for the original unweighted loss."""
+        self.validate(action_dim)
+        if self.mode == "default":
+            return None
+        weights = [0.0] * action_dim
+        for dim in self.valid_action_dims:
+            weights[int(dim)] = 1.0
+        if self.uses_lift_weight:
+            weights[int(self.lift_action_dim)] = float(self.lift_weight)
+        return tuple(weights)
+
+    def build_valid_mask(self, action_dim: int) -> tuple[float, ...] | None:
+        """Returns 1 for valid action dimensions and 0 for padding/unused dimensions."""
+        self.validate(action_dim)
+        if self.mode == "default":
+            return None
+        mask = [0.0] * action_dim
+        for dim in self.valid_action_dims:
+            mask[int(dim)] = 1.0
+        return tuple(mask)
+
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
@@ -627,6 +788,9 @@ class TrainConfig:
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
     ema_decay: float | None = 0.99
+
+    # Optional action-dimension loss masking/weighting. Default keeps the original OpenPI loss.
+    action_loss: ActionLossConfig = dataclasses.field(default_factory=ActionLossConfig)
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
@@ -695,6 +859,9 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        self.action_loss.validate(self.model.action_dim)
+
+
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
@@ -705,7 +872,7 @@ _CONFIGS = [
     
     # "0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_relocate_continue"
     TrainConfig(
-        name="0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_continue",
+        name="0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_relocate_continue",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
@@ -724,7 +891,7 @@ _CONFIGS = [
             ),
             action_mode="state_diff_arm_head_relative_gripper_base",
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("/work/gp36/b20072/hsr_openpi/checkpoints/0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_all/0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_all/35000"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/work/gp36/b20072/hsr_openpi/checkpoints/0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_all/0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_all/35000/params"),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=5e-5,
@@ -1329,7 +1496,7 @@ _CONFIGS = [
             "adapter": "apft_lora",
         },
     ),
-    # "0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_all"
+    # "0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_all_raw"
     TrainConfig(
         name="0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_all_raw",
         model=pi0_config.Pi0Config(
@@ -1364,6 +1531,7 @@ _CONFIGS = [
         prefetch_factor=1,
         num_train_steps=80_000,
         save_interval=2_000,
+        resume=True,
         policy_metadata={
             "robot": "toyota_hsr",
             "adapter": "fullfinetuning",
@@ -1427,6 +1595,7 @@ _CONFIGS = [
         prefetch_factor=1,
         num_train_steps=80_000,
         save_interval=2_000,
+        resume=True,
         policy_metadata={
             "robot": "toyota_hsr",
             "adapter": "fullfinetuning",
@@ -1455,13 +1624,13 @@ _CONFIGS = [
             ],
         },
     ),
-    # "0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_all_0415"
+    # "0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon24_all"
     TrainConfig(
-        name="0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_all_0415",
+        name="0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon24_all",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
-            action_horizon=8,
+            action_horizon=24,
         ),
         data=LeRobotHSRDataConfig(
             repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0404/step25_balance_3/train_dataset",
@@ -1490,6 +1659,7 @@ _CONFIGS = [
         prefetch_factor=1,
         num_train_steps=80_000,
         save_interval=2_000,
+        resume=True,
         policy_metadata={
             "robot": "toyota_hsr",
             "adapter": "fullfinetuning",
@@ -1518,7 +1688,7 @@ _CONFIGS = [
             ],
         },
     ),
-    # "0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_all_0415"
+    # "0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all"
     TrainConfig(
         name="0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all",
         model=pi0_config.Pi0Config(
@@ -1527,7 +1697,7 @@ _CONFIGS = [
             action_horizon=16,
         ),
         data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0404/step25_balance_3/train_dataset",
+            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
             assets=AssetsConfig(
                 assets_dir="./assets/airoa_hsr_shared",
                 asset_id="pi05_airoa_hsr_lora_horizon8_state_diff_arm_head_relative_gripper_base_gripperTrue",
@@ -1553,6 +1723,7 @@ _CONFIGS = [
         prefetch_factor=1,
         num_train_steps=80_000,
         save_interval=2_000,
+        resume=True,
         policy_metadata={
             "robot": "toyota_hsr",
             "adapter": "fullfinetuning",
@@ -1924,9 +2095,9 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
-
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
+    # *polaris_config.get_polaris_configs(),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

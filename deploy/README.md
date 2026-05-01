@@ -52,6 +52,14 @@ export POLICY_RECORD_DIR=
 export POLICY_PYTORCH_DEVICE=cuda
 ```
 
+For checkpoints trained with masked HSR action sampling, the sample mask is enabled automatically when the checkpoint path or `POLICY_CONFIG_NAME` contains `mask`. If the name does not contain `mask`, enable it manually:
+
+```bash
+export POLICY_ENABLE_ACTION_SAMPLE_MASK=true
+# Optional; defaults to the HSR 32-dim padded action layout.
+export POLICY_ACTION_SAMPLE_MASK_VALID_DIMS=0,1,2,3,4,6,11,12,13,14,15
+```
+
 ## 4. Start and verify containers
 
 ```bash

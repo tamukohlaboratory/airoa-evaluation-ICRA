@@ -1,0 +1,11 @@
+conda deactivate
+
+export HSR_ID=B022
+export HSR_IP=192.168.0.2
+export ROS_MASTER_URI=http://192.168.0.2:11311
+export ROS_IP=192.168.0.10
+export TEST_MODE=false
+export POLICY_SERVER_HOST=10.65.9.210 # HMA WiFi 5
+export POLICY_SERVER_PORT=8000
+export POLICY_CHECKPOINT_PATH=/home/bitell/Devenv/ICRA/baseline/50000/
+export POLICY_CONFIG_NAME=AIRoA_baseline
