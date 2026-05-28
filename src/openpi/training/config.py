@@ -19,11 +19,12 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
-import openpi.policies.libero_policy as libero_policy
 import openpi.policies.hsr_policy as hsr_policy
+import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
@@ -32,6 +33,14 @@ import openpi.transforms as _transforms
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
+
+
+def _resolve_path_or_uri(path: str | None) -> epath.Path | None:
+    if path is None:
+        return None
+    if "://" in path:
+        return epath.Path(path)
+    return epath.Path(pathlib.Path(path).expanduser().resolve())
 
 
 @dataclasses.dataclass(frozen=True)
@@ -96,7 +105,6 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # Path to the data filter file for DROID dataset
     filter_dict_path: str | None = None
-
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -179,12 +187,20 @@ class DataConfigFactory(abc.ABC):
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
+        assets_dir = _resolve_path_or_uri(self.assets.assets_dir) or epath.Path(assets_dirs)
+        base_config = self.base_config or DataConfig()
+        default_use_quantile = model_config.model_type != ModelType.PI0
+
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
-            use_quantile_norm=model_config.model_type != ModelType.PI0,
+            norm_stats=self._load_norm_stats(assets_dir, asset_id),
+            use_quantile_norm=(
+                base_config.use_quantile_norm
+                if self.base_config is not None
+                else default_use_quantile
+            ),
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
@@ -222,6 +238,57 @@ class SimpleDataConfig(DataConfigFactory):
             self.create_base_config(assets_dirs, model_config),
             data_transforms=self.data_transforms(model_config),
             model_transforms=self.model_transforms(model_config),
+        )
+@dataclasses.dataclass(frozen=True)
+class LeRobotAlohaDataConfig(DataConfigFactory):
+    # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
+    # Gripper dimensions will remain in absolute values.
+    use_delta_joint_actions: bool = True
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+    # If true, this will convert the joint and gripper values from the standard Aloha space to
+    # the space used by the pi internal runtime which was used to train the base model. People who
+    # use standard Aloha data should set this to true.
+    adapt_to_pi: bool = True
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {"cam_high": "observation.images.top"},
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
+            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -355,20 +422,28 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         )
 
 
-@dataclasses.dataclass(frozen=True)
-class RLDSDroidDataConfig(DataConfigFactory):
-    """
-    Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
-    """
+# @dataclasses.dataclass(frozen=True)
+# class RLDSDroidDataConfig(DataConfigFactory):
+#     """
+#     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
+#     """
 
-    rlds_data_dir: str | None = None
-    action_space: droid_rlds_dataset.DroidActionSpace | None = None
+#     rlds_data_dir: str | None = None
+#     action_space: droid_rlds_dataset.DroidActionSpace | None = None
 
-    # Filtering options. Can pass a path to a dictionary that maps episodes to timestep ranges
-    # to tuples denoting ranges of time steps to keep (start, end). Episodes are uniquely identified with
-    # f"{recording_folderpath}--{file_path}", both of which are present in the RLDS episode metadata.
-    # Path to the filter dictionary file.
-    filter_dict_path: str | None = "gs://openpi-assets/droid/droid_sample_ranges_v1_0_1.json"
+#     # Filtering options. Can pass a path to a dictionary that maps episodes to timestep ranges
+#     # to tuples denoting ranges of time steps to keep (start, end). Episodes are uniquely identified with
+#     # f"{recording_folderpath}--{file_path}", both of which are present in the RLDS episode metadata.
+
+#     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
+#     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = (
+#         droid_rlds_dataset.RLDSDataset(
+#             name="droid",
+#             version="1.0.1",
+#             weight=1.0,
+#             filter_dict_path="gs://openpi-assets/droid/droid_sample_ranges_v1_0_1.json",
+#         ),
+#     )
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -411,7 +486,7 @@ class RLDSDroidDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             rlds_data_dir=self.rlds_data_dir,
             action_space=self.action_space,
-            filter_dict_path=self.filter_dict_path,
+            datasets=self.datasets,
         )
 
 
@@ -452,35 +527,31 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
-        
+
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotHSRDataConfig(DataConfigFactory):
     # If provided, will be injected into the input data if the "prompt" key is not present.
     default_prompt: str | None = None
 
-    # If true, this will convert the joint and gripper values from the HSR space to
-    # the space used by the pi internal runtime (trossen mobile) which was used to train the base model. People who
-    # use the HSR data should set this to true.
+    # If true, convert HSR joint ordering/state layout to the pi runtime layout used by the base checkpoint.
     adapt_to_pi: bool = True
 
-    # Action keys that will be used to read the action sequence from the dataset.
-    action_sequence_keys: Sequence[str] = ("action.state_diff", "action.relative")
+    # Use arm/head state-difference actions together with relative gripper/base actions by default.
+    action_mode: Literal[
+        "relative",
+        "absolute_arm_head_relative_gripper_base",
+        "state_diff_arm_head_relative_gripper_base",
+    ] = "state_diff_arm_head_relative_gripper_base"
 
-    # Select which action source to use.
-    # - "relative": use only action.relative
-    # - "absolute_arm_head_relative_gripper_base": use arm/head from action.absolute and gripper/base from action.relative
-    # - "state_diff_arm_head_relative_gripper_base": use arm/head from action.state_diff and gripper/base from action.relative
-    action_mode: str = "relative"
-
-    # If true, apply gripper conversion between HSR and pi0 angular space.
+    # If true, convert the HSR gripper representation to the angular space used by the base model.
     convert_gripper: bool = False
 
-    # Base action dimension appended from action.relative when action_mode is state_diff_with_base.
+    # Number of base action dimensions appended from the relative action stream.
     base_action_dim: int = 3
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-
         if self.action_mode == "relative":
             action_sequence_keys = ("action.relative",)
             repack_transform = _transforms.Group(
@@ -520,7 +591,7 @@ class LeRobotHSRDataConfig(DataConfigFactory):
                             "head_rgb": "observation.image.head",
                             "hand_rgb": "observation.image.hand",
                             "state": "observation.state",
-                            "actions_absolute": "action.absolute",
+                            "actions_state_diff": "action.absolute",
                             "actions_relative": "action.relative",
                             "prompt": "prompt",
                         }
@@ -530,7 +601,7 @@ class LeRobotHSRDataConfig(DataConfigFactory):
             data_transforms = _transforms.Group(
                 inputs=[
                     _transforms.CombineStateDiffArmHeadRelativeGripperBase(
-                        state_diff_key="actions_absolute",
+                        state_diff_key="actions_state_diff",
                         relative_key="actions_relative",
                         base_dim=self.base_action_dim,
                     ),
@@ -538,7 +609,7 @@ class LeRobotHSRDataConfig(DataConfigFactory):
                         action_dim=model_config.action_dim,
                         adapt_to_pi=self.adapt_to_pi,
                         convert_gripper=self.convert_gripper,
-                    )
+                    ),
                 ],
                 outputs=[
                     hsr_policy.HSROutputs(
@@ -565,9 +636,7 @@ class LeRobotHSRDataConfig(DataConfigFactory):
             )
             data_transforms = _transforms.Group(
                 inputs=[
-                    _transforms.CombineStateDiffArmHeadRelativeGripperBase(
-                        base_dim=self.base_action_dim
-                    ),
+                    _transforms.CombineStateDiffArmHeadRelativeGripperBase(base_dim=self.base_action_dim),
                     hsr_policy.HSRInputs(
                         action_dim=model_config.action_dim,
                         adapt_to_pi=self.adapt_to_pi,
@@ -583,30 +652,127 @@ class LeRobotHSRDataConfig(DataConfigFactory):
             )
         else:
             raise ValueError(
-                "Invalid action_mode. Expected 'relative', "
-                "'absolute_arm_head_relative_gripper_base', or "
+                "Invalid action_mode. Expected 'relative', 'absolute_arm_head_relative_gripper_base', or "
                 "'state_diff_arm_head_relative_gripper_base'."
             )
 
-        # Prepare data for policy training
-        # Convert images to uint8 numpy arrays, add masks
-        # Model transforms include things like tokenizing the prompt and action targets
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
-
         return dataclasses.replace(
-            self.create_base_config(assets_dirs,model_config=model_config),
+            self.create_base_config(assets_dirs, model_config=model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=action_sequence_keys,
         )
 
+
+
+HSR_VALID_ACTION_DIMS: tuple[int, ...] = (0, 1, 2, 3, 4, 6, 11, 12, 13, 14, 15)
+
+
+@dataclasses.dataclass(frozen=True)
+class ActionLossConfig:
+    """Controls optional action-dimension masking and weighting for flow-matching action loss.
+
+    Modes:
+      default:
+        Original behavior. Mean MSE over all model action dimensions.
+      valid_action_only:
+        Compute the loss only on valid robot action dimensions. Padding/unused dimensions get weight 0.
+      valid_action_lift_weighted:
+        Same as valid_action_only, but upweights the arm_lift_joint action dimension.
+      valid_action_only_masked:
+        Same as valid_action_only, and additionally masks actions/noise/x_t/u_t during training.
+        Policy creation also passes the valid-action mask to sampling, so unused dimensions stay zero during denoising.
+      valid_action_lift_weighted_masked:
+        Same as valid_action_lift_weighted, and additionally masks actions/noise/x_t/u_t during training.
+        Policy creation also passes the valid-action mask to sampling, so unused dimensions stay zero during denoising.
+    """
+
+    mode: Literal[
+        "default",
+        "valid_action_only",
+        "valid_action_lift_weighted",
+        "valid_action_only_masked",
+        "valid_action_lift_weighted_masked",
+    ] = "default"
+
+    # HSR 32-dim padded action layout used by state_diff_arm_head_relative_gripper_base:
+    #   0 arm_lift_joint, 1 arm_flex_joint, 2 arm_roll_joint, 3 wrist_flex_joint, 4 wrist_roll_joint,
+    #   6 gripper, 11 head_pan_joint, 12 head_tilt_joint, 13 base_x, 14 base_y, 15 base_theta.
+    valid_action_dims: tuple[int, ...] = HSR_VALID_ACTION_DIMS
+    lift_action_dim: int = 0
+    lift_weight: float = 5.0
+
+    @property
+    def uses_valid_action_loss(self) -> bool:
+        return self.mode != "default"
+
+    @property
+    def uses_lift_weight(self) -> bool:
+        return self.mode in {"valid_action_lift_weighted", "valid_action_lift_weighted_masked"}
+
+    @property
+    def masks_actions_and_noise(self) -> bool:
+        return self.mode in {"valid_action_only_masked", "valid_action_lift_weighted_masked"}
+
+    def validate(self, action_dim: int) -> None:
+        valid_modes = {
+            "default",
+            "valid_action_only",
+            "valid_action_lift_weighted",
+            "valid_action_only_masked",
+            "valid_action_lift_weighted_masked",
+        }
+        if self.mode not in valid_modes:
+            raise ValueError(f"Unknown action loss mode: {self.mode!r}. Expected one of {sorted(valid_modes)}.")
+        if action_dim <= 0:
+            raise ValueError(f"action_dim must be positive, got {action_dim}.")
+        if self.lift_weight <= 0:
+            raise ValueError(f"lift_weight must be positive, got {self.lift_weight}.")
+        if self.mode == "default":
+            return
+        if not self.valid_action_dims:
+            raise ValueError("valid_action_dims must not be empty when action loss masking is enabled.")
+        invalid_dims = sorted({int(d) for d in self.valid_action_dims if int(d) < 0 or int(d) >= action_dim})
+        if invalid_dims:
+            raise ValueError(
+                f"valid_action_dims contains indices outside action_dim={action_dim}: {invalid_dims}."
+            )
+        if self.uses_lift_weight and self.lift_action_dim not in self.valid_action_dims:
+            raise ValueError(
+                f"lift_action_dim={self.lift_action_dim} must be included in valid_action_dims "
+                "when lift weighting is enabled."
+            )
+
+    def build_loss_weights(self, action_dim: int) -> tuple[float, ...] | None:
+        """Returns per-action-dimension loss weights, or None for the original unweighted loss."""
+        self.validate(action_dim)
+        if self.mode == "default":
+            return None
+        weights = [0.0] * action_dim
+        for dim in self.valid_action_dims:
+            weights[int(dim)] = 1.0
+        if self.uses_lift_weight:
+            weights[int(self.lift_action_dim)] = float(self.lift_weight)
+        return tuple(weights)
+
+    def build_valid_mask(self, action_dim: int) -> tuple[float, ...] | None:
+        """Returns 1 for valid action dimensions and 0 for padding/unused dimensions."""
+        self.validate(action_dim)
+        if self.mode == "default":
+            return None
+        mask = [0.0] * action_dim
+        for dim in self.valid_action_dims:
+            mask[int(dim)] = 1.0
+        return tuple(mask)
+
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
     # Project name.
-    project_name: str = "hsr_openpi"
+    project_name: str = "openpi"
     # Experiment name. Will be used to name the metadata and checkpoint directories.
     exp_name: str = tyro.MISSING
 
@@ -623,13 +789,13 @@ class TrainConfig:
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
-    
-    # sample the first batch and send to the wandb
-    pytorch_sample_data: bool = False
 
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
     ema_decay: float | None = 0.99
+
+    # Optional action-dimension loss masking/weighting. Default keeps the original OpenPI loss.
+    action_loss: ActionLossConfig = dataclasses.field(default_factory=ActionLossConfig)
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
@@ -649,17 +815,15 @@ class TrainConfig:
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
+    # Optional PyTorch DataLoader prefetch factor. Only applies when num_workers > 0.
+    prefetch_factor: int | None = None
     # Number of train steps (batches) to run.
-    num_train_steps: int = 30_000
-    # If set, derive the total number of train steps from the dataset size and global batch size.
-    # This value represents the total number of epochs from step 0 (not additional epochs when resuming).
-    # If provided, this overrides num_train_steps.
-    num_train_epochs: float | None = 1.0
+    num_train_steps: int = 300_000
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
-    save_interval: int = 1000
+    save_interval: int = 100000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
@@ -700,29 +864,101 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
-        if self.num_train_steps <= 0:
-            raise ValueError("num_train_steps must be > 0.")
-        if self.num_train_epochs is not None and self.num_train_epochs <= 0:
-            raise ValueError("num_train_epochs must be > 0 when set.")
+        if isinstance(self.data, LeRobotHSRDataConfig) and self.action_loss.mode == "default":
+            object.__setattr__(self, "action_loss", ActionLossConfig(mode="valid_action_only_masked"))
+        self.action_loss.validate(self.model.action_dim)
+
+
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
-    # Toyota HSR + AIROA MoMa fine-tuning configs.
+    ###############################################
+    # 0412 added HSR state-diff configs.
+    # NOTE: dataset suffix (_relocate / _all) is appended to keep names unique.
+    ################################################ 
+    
+    # "0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_relocate_continue"
     TrainConfig(
-        name="pi05_airoa_hsr_full",
+        name="0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_relocate_continue",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=8,
+        ),
+        data=LeRobotHSRDataConfig(
+            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
+            assets=AssetsConfig(
+                assets_dir="./assets/airoa_hsr_shared",
+                asset_id="pi05_airoa_hsr_lora_horizon8_state_diff_arm_head_relative_gripper_base_gripperTrue",
+            ),
+            convert_gripper=True,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                use_quantile_norm=False,
+            ),
+            action_mode="state_diff_arm_head_relative_gripper_base",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/work/gp36/b20072/hsr_openpi/checkpoints/0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_all/0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon8_all/35000/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=100_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        batch_size=32,
+        num_workers=0,
+        prefetch_factor=1,
+        num_train_steps=80_000,
+        save_interval=2_000,
+        policy_metadata={
+            "robot": "toyota_hsr",
+            "adapter": "fullfinetuning",
+            "state_names": [
+                "arm_lift_joint",
+                "arm_flex_joint",
+                "arm_roll_joint",
+                "wrist_flex_joint",
+                "wrist_roll_joint",
+                "gripper",
+                "head_pan_joint",
+                "head_tilt_joint",
+            ],
+            "action_names": [
+                "arm_lift_joint",
+                "arm_flex_joint",
+                "arm_roll_joint",
+                "wrist_flex_joint",
+                "wrist_roll_joint",
+                "gripper",
+                "head_pan_joint",
+                "head_tilt_joint",
+                "base_x",
+                "base_y",
+                "base_theta",
+            ],
+        },
+    ),
+    # "0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all"
+    TrainConfig(
+        name="0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
             action_horizon=16,
         ),
         data=LeRobotHSRDataConfig(
-            #repo_id="airoa-org/airoa-moma",
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0324/step2_dataset/",
+            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
             assets=AssetsConfig(
                 assets_dir="./assets/airoa_hsr_shared",
-                asset_id="airoa_hsr",
+                asset_id="pi05_airoa_hsr_lora_horizon8_state_diff_arm_head_relative_gripper_base_gripperTrue",
             ),
-            base_config=DataConfig(prompt_from_task=True),
+            convert_gripper=True,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                use_quantile_norm=False,
+            ),
             action_mode="state_diff_arm_head_relative_gripper_base",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
@@ -736,10 +972,13 @@ _CONFIGS = [
         ema_decay=0.999,
         batch_size=32,
         num_workers=0,
+        prefetch_factor=1,
         num_train_steps=80_000,
         save_interval=2_000,
+        resume=True,
         policy_metadata={
             "robot": "toyota_hsr",
+            "adapter": "fullfinetuning",
             "state_names": [
                 "arm_lift_joint",
                 "arm_flex_joint",
@@ -766,22 +1005,26 @@ _CONFIGS = [
         },
     ),
 
+    # "0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all"
     TrainConfig(
-        name="pi05_hsr_full_statediff_GTure_curated10K",
+        name="0412_pi05_airoa_hsr_relative_horizon16_all",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
-            action_horizon=8,
+            action_horizon=16,
         ),
         data=LeRobotHSRDataConfig(
-            #repo_id="airoa-org/airoa-moma",
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min250",
+            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
             assets=AssetsConfig(
                 assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_hsr_full_statediff_GTure_curated10K",
+                asset_id="task6891011_level12_v2.5_train",
             ),
-            base_config=DataConfig(prompt_from_task=True),
-            action_mode="state_diff_arm_head_relative_gripper_base",
+            convert_gripper=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                use_quantile_norm=False,
+            ),
+            action_mode="relative",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -794,10 +1037,13 @@ _CONFIGS = [
         ema_decay=0.999,
         batch_size=32,
         num_workers=0,
+        prefetch_factor=1,
         num_train_steps=80_000,
         save_interval=2_000,
+        resume=True,
         policy_metadata={
             "robot": "toyota_hsr",
+            "adapter": "fullfinetuning",
             "state_names": [
                 "arm_lift_joint",
                 "arm_flex_joint",
@@ -824,883 +1070,6 @@ _CONFIGS = [
         },
     ),
 
-    TrainConfig(
-        name="pi05_airoa_hsr_lora",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=16,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            #repo_id="airoa-org/airoa-moma",
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0324/step2_dataset/",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="airoa_hsr",
-            ),
-            base_config=DataConfig(prompt_from_task=True),
-            action_mode="state_diff_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=16,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),
-    #name="pi05_hsr_lora_horizon8_statediff_GFalse_mean_std_wakamatsu_pro",
-    TrainConfig(
-        name="pi05_hsr_lora_horizon8_statediff_GFalse_mean_std_wakamatsu_pro",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/share/AIROA_moma/wakamatsu_ct_pro",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_hsr_lora_horizon8_statediff_GTrue_mean_std_wakamatsu_pro",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=False,    
-            ),
-            convert_gripper = False,
-            action_mode="state_diff_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),
-    #name="pi05_hsr_lora_horizon8_relative_GTrue_mean_std_wakamatsu_pro",
-    TrainConfig(
-    name="pi05_hsr_lora_horizon8_relative_GTrue_mean_std_wakamatsu_pro",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/share/AIROA_moma/wakamatsu_ct_pro",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_hsr_lora_horizon8_relative_GTrue_mean_std_wakamatsu_pro",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=False,    
-            ),
-            convert_gripper = True,
-            action_mode="relative",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),
-    #name="pi05_hsr_lora_horizon8_relative_GFalse_mean_std_wakamatsu_pro",
-    TrainConfig(
-        name="pi05_hsr_lora_horizon8_relative_GFalse_mean_std_wakamatsu_pro",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/share/AIROA_moma/wakamatsu_ct_pro",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_hsr_lora_horizon8_relative_GFalse_mean_std_wakamatsu_pro",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=False,    
-            ),
-            convert_gripper = False,
-            action_mode="relative",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),
-    #name="pi05_hsr_lora_horizon8_absolute_GTrue_mean_std_wakamatsu_pro",
-    TrainConfig(
-        name="pi05_hsr_lora_horizon8_absolute_GTrue_mean_std_wakamatsu_pro",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/share/AIROA_moma/wakamatsu_ct_pro",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_hsr_lora_horizon8_absolute_GTrue_mean_std_wakamatsu_pro",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=True,    
-            ),
-            convert_gripper = True,
-            action_mode="absolute_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),
-    #name="pi05_hsr_lora_horizon8_absolute_GFalse_mean_std_wakamatsu_pro",   
-    TrainConfig(
-        name="pi05_hsr_lora_horizon8_absolute_GFalse_mean_std_wakamatsu_pro",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/share/AIROA_moma/wakamatsu_ct_pro",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_hsr_lora_horizon8_absolute_GFalse_mean_std_wakamatsu_pro",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=True,    
-            ),
-            convert_gripper = False,
-            action_mode="absolute_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),
-    #name="pi05_hsr_lora_horizon24_state_diff_GTrue_curated_relocate",
-    TrainConfig(
-        name="pi05_hsr_lora_horizon24_state_diff_GTrue_curated_relocate",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=24,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_hsr_lora_horizon24_state_diff_GTrue_curated_relocate",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=False,    
-            ),
-            convert_gripper = True,
-            action_mode="state_diff_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=24,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),
-    #name="pi05_hsr_lora_horizon16_state_diff_GTrue_curated_relocate",
-    TrainConfig(
-        name="pi05_hsr_lora_horizon16_state_diff_GTrue_curated_relocate",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=16,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_hsr_lora_horizon16_state_diff_GTrue_curated_relocate",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=False,    
-            ),
-            convert_gripper = True,
-            action_mode="state_diff_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=16,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),    
-    #name="pi05_hsr_lora_horizon5_state_diff_GTrue_curated_relocate",
-    TrainConfig(
-        name="pi05_hsr_lora_horizon5_state_diff_GTrue_curated_relocate",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=5,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_hsr_lora_horizon5_state_diff_GTrue_curated_relocate",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=False,    
-            ),
-            convert_gripper = True,
-            action_mode="state_diff_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=5,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),    
-    #name="pi05_hsr_lora_horizon8_state_diff_GTrue_curated_relocate",
-    TrainConfig(
-        name="pi05_hsr_lora_horizon8_state_diff_GTrue_curated_relocate",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_hsr_lora_horizon8_state_diff_GTrue_curated_relocate",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=False,    
-            ),
-            convert_gripper = True,
-            action_mode="state_diff_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),
-    #name="pi05_hsr_lora_horizon8_state_diff_GFalse_curated_relocate",
-    TrainConfig(
-        name="pi05_hsr_lora_horizon8_state_diff_GFalse_curated_relocate",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_hsr_lora_horizon8_state_diff_GFalse_curated_relocate",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=False,    
-            ),
-            convert_gripper = False,
-            action_mode="state_diff_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),
-    #name="pi05_hsr_lora_horizon24_state_diff_GTrue_curated_relocate_norm_aws",
-    TrainConfig(
-        name="pi05_hsr_lora_horizon24_state_diff_GTrue_curated_relocate_norm_aws",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=24,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_airoa_hsr_lora_horizon24_state_diff_arm_head_relative_gripper_base_gripperTrue_mean_std",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=False,    
-            ),
-            convert_gripper = True,
-            action_mode="state_diff_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=24,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),
-    #name="pi05_hsr_lora_horizon16_state_diff_GTrue_curated_relocate_norm_aws",
-    TrainConfig(
-        name="pi05_hsr_lora_horizon16_state_diff_GTrue_curated_relocate_norm_aws",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=16,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_airoa_hsr_lora_horizon16_state_diff_arm_head_relative_gripper_base_gripperTrue_mean_std",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=False,    
-            ),
-            convert_gripper = True,
-            action_mode="state_diff_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=16,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),    
-    #name="pi05_hsr_lora_horizon5_state_diff_GTrue_curated_relocate_norm_aws",
-    TrainConfig(
-        name="pi05_hsr_lora_horizon5_state_diff_GTrue_curated_relocate_norm_aws",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=5,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_airoa_hsr_lora_horizon5_state_diff_arm_head_relative_gripper_base_gripperTrue_mean_std",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=False,    
-            ),
-            convert_gripper = True,
-            action_mode="state_diff_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=5,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),    
-    #name="pi05_hsr_lora_horizon8_state_diff_GTrue_curated_relocate_norm_aws",
-    TrainConfig(
-        name="pi05_hsr_lora_horizon8_state_diff_GTrue_curated_relocate_norm_aws",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_airoa_hsr_lora_horizon8_state_diff_arm_head_relative_gripper_base_gripperTrue_mean_std",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=False,    
-            ),
-            convert_gripper = True,
-            action_mode="state_diff_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),
-    #name="pi05_hsr_lora_horizon8_state_diff_GFalse_curated_relocate_norm_aws",
-    TrainConfig(
-        name="pi05_hsr_lora_horizon8_state_diff_GFalse_curated_relocate_norm_aws",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_airoa_hsr_lora_horizon8_state_diff_arm_head_relative_gripper_base_gripperFalse_mean_std",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=False,    
-            ),
-            convert_gripper = False,
-            action_mode="state_diff_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),
-    #name="pi05_hsr_lora_horizon8_absolute_GTrue_curated_relocate",
-    TrainConfig(
-        name="pi05_hsr_lora_horizon8_absolute_GTrue_curated_relocate",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_hsr_lora_horizon8_absolute_GTrue_curated_relocate",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=True,    
-            ),
-            convert_gripper = True,
-            action_mode="absolute_arm_head_relative_gripper_base",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),
-    TrainConfig(
-        name="pi05_hsr_lora_horizon8_relative_GTrue_curated_relocate",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotHSRDataConfig(
-            repo_id="/work/gp36/b20072/HSR_Curation/outputs/curation/miyabi_run_0327/step2_min200_relocate",
-            assets=AssetsConfig(
-                assets_dir="./assets/airoa_hsr_shared",
-                asset_id="pi05_hsr_lora_horizon8_relative_GTrue_curated_relocate",
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-                use_quantile_norm=False,    
-            ),
-            convert_gripper = True,
-            action_mode="relative",
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-4,
-            decay_steps=100_000,
-            decay_lr=1e-5,
-        ),        
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        num_train_steps=80_000,
-        batch_size=64,
-        num_workers=0,
-        save_interval=2_000,
-        overwrite=True,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=8,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        policy_metadata={
-            "robot": "toyota_hsr",
-            "adapter": "lora",
-        },
-    ),
-    #
     # Debugging configs.
     #
     TrainConfig(
@@ -1725,8 +1094,20 @@ _CONFIGS = [
         num_train_steps=10,
         wandb_enabled=False,
     ),
+    TrainConfig(
+        name="debug_pi05",
+        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="debug_pi05",
+        wandb_enabled=False,
+    ),
+    # RoboArena & PolaRiS configs.
+    *roboarena_config.get_roboarena_configs(),
+    # *polaris_config.get_polaris_configs(),
 ]
-
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
@@ -1745,3 +1126,5 @@ def get_config(config_name: str) -> TrainConfig:
         raise ValueError(f"Config '{config_name}' not found.{closest_str}")
 
     return _CONFIGS_DICT[config_name]
+
+

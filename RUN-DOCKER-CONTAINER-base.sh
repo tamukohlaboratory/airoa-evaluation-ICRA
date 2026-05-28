@@ -8,11 +8,12 @@ export CYCLONEDDS_URI=file:///home/bitell/cyclonedds.xml
 unset CYCLONEDDS_INTERFACE
 export CYCLONEDDS_INTERFACE_ADDRESS=192.168.11.222
 export CYCLONEDDS_PEERS=192.168.11.22
-#export POLICY_SERVER_HOST=172.30.21.201 # Hma
 export POLICY_SERVER_HOST=10.65.9.210
 export POLICY_SERVER_PORT=8000
-export POLICY_CHECKPOINT_PATH="/home/bitell/Devenv/ICRA/0430_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all/65000"
-export POLICY_CONFIG_NAME="0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all"
+# export POLICY_CHECKPOINT_PATH="/home/bitell/Devenv/ICRA/0430_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all/65000"
+# export POLICY_CONFIG_NAME="0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all"
+# export POLICY_CHECKPOINT_PATH="/home/bitell/Devenv/ICRA/baseline/50000"
+# export POLICY_CONFIG_NAME="0412_pi05_airoa_hsr_relative_horizon16_all"
 
 set -euo pipefail
 

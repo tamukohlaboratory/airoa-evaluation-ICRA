@@ -187,17 +187,45 @@ class Pi0(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        action_loss_weights=None,
+        mask_actions_and_noise: bool = False,
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
+        action_weights = None
+        action_valid_mask = None
+        if action_loss_weights is not None:
+            action_weights = jnp.asarray(action_loss_weights, dtype=actions.dtype)
+            if action_weights.shape != (self.action_dim,):
+                raise ValueError(
+                    f"action_loss_weights must have shape ({self.action_dim},), got {action_weights.shape}."
+                )
+            mask_shape = (1,) * (actions.ndim - 1) + (self.action_dim,)
+            action_valid_mask = jnp.reshape((action_weights > 0).astype(actions.dtype), mask_shape)
+            action_weights = jnp.reshape(action_weights.astype(actions.dtype), mask_shape)
+            if mask_actions_and_noise:
+                actions = actions * action_valid_mask
+        elif mask_actions_and_noise:
+            raise ValueError("mask_actions_and_noise=True requires action_loss_weights to define valid action dims.")
+
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
+        if mask_actions_and_noise:
+            noise = noise * action_valid_mask
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
+        if mask_actions_and_noise:
+            x_t = x_t * action_valid_mask
+            u_t = u_t * action_valid_mask
 
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -211,7 +239,11 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        per_dim_loss = jnp.square(v_t - u_t)
+        if action_weights is None:
+            return jnp.mean(per_dim_loss, axis=-1)
+        denom = jnp.maximum(jnp.sum(action_weights), jnp.asarray(1e-8, dtype=per_dim_loss.dtype))
+        return jnp.sum(per_dim_loss * action_weights, axis=-1) / denom
 
     @override
     def sample_actions(
@@ -221,14 +253,25 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        action_sample_mask=None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
+
+        sample_mask = None
+        if action_sample_mask is not None:
+            sample_mask = jnp.asarray(action_sample_mask, dtype=observation.state.dtype)
+            if sample_mask.shape != (self.action_dim,):
+                raise ValueError(f"action_sample_mask must have shape ({self.action_dim},), got {sample_mask.shape}.")
+            sample_mask = jnp.reshape(sample_mask, (1, 1, self.action_dim))
+
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+        if sample_mask is not None:
+            noise = noise * sample_mask
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -268,7 +311,12 @@ class Pi0(_model.BaseModel):
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-            return x_t + dt * v_t, time + dt
+            if sample_mask is not None:
+                v_t = v_t * sample_mask
+            x_next = x_t + dt * v_t
+            if sample_mask is not None:
+                x_next = x_next * sample_mask
+            return x_next, time + dt
 
         def cond(carry):
             x_t, time = carry

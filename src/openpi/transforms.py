@@ -115,7 +115,8 @@ class CombineStateDiffAndRelativeBase(DataTransformFn):
             if self.relative_key in data:
                 data[self.output_key] = np.asarray(data[self.relative_key])
                 return data
-            # Inference inputs do not include action sequences.
+            # In inference we only receive observations, so there may be no action keys at all.
+            # Keep the sample unchanged and let downstream transforms handle observation-only inputs.
             return data
 
         state_diff = np.asarray(data[self.state_diff_key])
@@ -160,7 +161,8 @@ class CombineStateDiffArmHeadRelativeGripperBase(DataTransformFn):
             if self.relative_key in data:
                 data[self.output_key] = np.asarray(data[self.relative_key])
                 return data
-            # Inference inputs do not include action sequences.
+            # In inference we only receive observations, so there may be no action keys at all.
+            # Keep the sample unchanged and let downstream transforms handle observation-only inputs.
             return data
 
         state_diff = np.asarray(data[self.state_diff_key])

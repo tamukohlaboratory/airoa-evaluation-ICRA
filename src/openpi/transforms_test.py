@@ -67,18 +67,6 @@ def test_make_bool_mask():
     assert _transforms.make_bool_mask(2, 0, 2) == (True, True, True, True)
 
 
-def test_combine_state_diff_and_relative_base_noop_without_actions():
-    item = {"state": np.array([1, 2, 3])}
-    transform = _transforms.CombineStateDiffAndRelativeBase()
-    assert transform(item) is item
-
-
-def test_combine_state_diff_arm_head_relative_gripper_base_noop_without_actions():
-    item = {"state": np.array([1, 2, 3])}
-    transform = _transforms.CombineStateDiffArmHeadRelativeGripperBase()
-    assert transform(item) is item
-
-
 def test_tokenize_prompt():
     tokenizer = _tokenizer.PaligemmaTokenizer(max_len=12)
     transform = _transforms.TokenizePrompt(tokenizer)

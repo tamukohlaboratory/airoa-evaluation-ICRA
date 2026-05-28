@@ -176,8 +176,14 @@ CAMERA_TOPICS_BY_HSR_ID: dict[str, dict[str, str]] = {
         "hand_compressed": "/hand_camera/color/image_rect_raw/compressed",
         "hand_raw": "/hand_camera/color/image_rect_raw",
     },
+    "B022": {
+        "head_compressed": "/head_rgbd_sensor/rgb/image_rect_color/compressed",
+        "head_raw": "/head_rgbd_sensor/rgb/image_rect_color",
+        "hand_compressed": "/hand_camera/image_raw/compressed",
+        "hand_raw": "/hand_camera/image_raw",
+    },
 }
-DEFAULT_HSR_ID = "MHSRC"
+DEFAULT_HSR_ID = "B022"
 
 
 def _resolve_camera_topics_for_hsr(hsr_id: Any) -> tuple[str, dict[str, str]]:

@@ -88,3 +88,20 @@ ros2 launch hsr_policy_client hsr_policy_client.launch.py \
 server metadata が取れない古い構成を使う場合だけ，必要に応じて
 `action_mode:=relative` / `action_mode:=absolute_arm_head_relative_gripper_base` /
 `action_mode:=state_diff_arm_head_relative_gripper_base` を明示してください．
+
+```
+ros2 launch hsr_policy_client hsr_policy_client.launch.py \
+  test_mode:=false \
+  action_mode:=state_diff_arm_head_relative_gripper_base \
+  instruction:='pick up the coffee bottle on the right' 
+```
+
+```
+ros2 launch hsr_policy_client hsr_policy_client.launch.py \
+  test_mode:=false \
+  action_mode:=relative \
+  instruction:='pick up the coffee bottle on the right' 
+```
+
+export POLICY_CONFIG_NAME="0412_pi05_airoa_hsr_relative_horizon16_all"
+export POLICY_CHECKPOINT_PATH="/home/bitell/Devenv/ICRA/baseline/50000"
