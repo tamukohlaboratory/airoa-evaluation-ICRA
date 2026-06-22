@@ -31,6 +31,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("ema_alpha", default_value="0.2"),
         DeclareLaunchArgument("ma_window", default_value="5"),
         DeclareLaunchArgument("smooth_gripper", default_value="true"),
+     
         DeclareLaunchArgument("smooth_base", default_value="true"),
         DeclareLaunchArgument("gripper_mode", default_value="discrete"),
         DeclareLaunchArgument("require_control_mode", default_value="false"),

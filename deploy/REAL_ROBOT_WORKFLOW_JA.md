@@ -104,4 +104,4 @@ ros2 launch hsr_policy_client hsr_policy_client.launch.py \
 ```
 
 export POLICY_CONFIG_NAME="0412_pi05_airoa_hsr_relative_horizon16_all"
-export POLICY_CHECKPOINT_PATH="/home/bitell/Devenv/ICRA/baseline/50000"
+export POLICY_CHECKPOINT_PATH="/home/bitell/Devenv/ICRA/baseline/80000"
