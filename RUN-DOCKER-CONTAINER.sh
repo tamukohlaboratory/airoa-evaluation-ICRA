@@ -15,7 +15,7 @@ export ROS_DOMAIN_ID=75
 export CYCLONEDDS_INTERFACE_ADDRESS=192.168.11.7 # hsrb75
 export CYCLONEDDS_PEERS=192.168.11.75 # hsrb75
 
-export POLICY_SERVER_HOST=172.30.21.118
+export POLICY_SERVER_HOST=172.30.21.165
 export POLICY_SERVER_PORT=8000
 # export POLICY_CHECKPOINT_PATH="/home/bitell/Devenv/ICRA/0430_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all/65000"
 # export POLICY_CONFIG_NAME="0412_pi05_airoa_hsr_fullfinetuning_statediff_horizon16_all"
@@ -147,9 +147,11 @@ cmd_shell() {
     elif [[ -n "${cyclonedds_interface}" ]]; then
       network_interface_attrs="${network_interface_attrs} name=\"${cyclonedds_interface}\""
     fi
+    local max_auto_participant_index_block=""
     if [[ -n "${cyclonedds_peers}" ]]; then
       allow_multicast_value="false"
       participant_index_value="auto"
+      max_auto_participant_index_block="      <MaxAutoParticipantIndex>${CYCLONEDDS_MAX_AUTO_PARTICIPANT_INDEX:-100}</MaxAutoParticipantIndex>"
       local peer_entries=""
       local peer
       IFS=',' read -r -a cyclonedds_peer_array <<< "${cyclonedds_peers}"
@@ -182,6 +184,7 @@ cmd_shell() {
     </General>
     <Discovery>
       <ParticipantIndex>${participant_index_value}</ParticipantIndex>
+${max_auto_participant_index_block}
 ${peers_block}
     </Discovery>
     <Internal>
