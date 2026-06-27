@@ -36,6 +36,7 @@ services:
       DISPLAY: ${DISPLAY:-:0}
       QT_X11_NO_MITSHM: "1"
       TEST_MODE: ${TEST_MODE:-true}
+      HSR_ID: ${HSR_ID:-B075}
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-0}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-}
@@ -52,6 +53,6 @@ services:
       source /opt/ros/humble/setup.bash &&
       source /root/ros2_ws/install/setup.bash &&
       echo '[INFO] Client container is ready. Run ros2 launch manually:' &&
-      echo 'ros2 launch hsr_policy_client hsr_policy_client.launch.py policy_server_host:=${POLICY_SERVER_HOST:-127.0.0.1} policy_server_port:=${POLICY_SERVER_PORT:-8000} policy_server_api_key:=${POLICY_SERVER_API_KEY:-} test_mode:=${TEST_MODE:-true}' &&
+      echo 'ros2 launch hsr_policy_client hsr_policy_client.launch.py hsr_id:=${HSR_ID:-B075} policy_server_host:=${POLICY_SERVER_HOST:-127.0.0.1} policy_server_port:=${POLICY_SERVER_PORT:-8000} policy_server_api_key:=${POLICY_SERVER_API_KEY:-} test_mode:=${TEST_MODE:-true}' &&
       sleep infinity
       "

@@ -11,6 +11,10 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("config_name", default_value="remote_policy"),
         DeclareLaunchArgument("action_mode", default_value="auto"),
         DeclareLaunchArgument(
+            "hsr_id",
+            default_value=EnvironmentVariable("HSR_ID", default_value="B075"),
+        ),
+        DeclareLaunchArgument(
             "policy_server_host",
             default_value=EnvironmentVariable("POLICY_SERVER_HOST", default_value="127.0.0.1"),
         ),
@@ -44,6 +48,7 @@ def generate_launch_description() -> LaunchDescription:
         "instruction": LaunchConfiguration("instruction"),
         "config_name": LaunchConfiguration("config_name"),
         "action_mode": LaunchConfiguration("action_mode"),
+        "hsr_id": LaunchConfiguration("hsr_id"),
         "policy_server_host": LaunchConfiguration("policy_server_host"),
         "policy_server_port": ParameterValue(LaunchConfiguration("policy_server_port"), value_type=int),
         "policy_server_api_key": LaunchConfiguration("policy_server_api_key"),

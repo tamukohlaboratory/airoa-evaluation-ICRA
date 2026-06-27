@@ -20,7 +20,11 @@ RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc | g
     ros-humble-rosidl-default-generators \
     && rm -rf /var/lib/apt/lists/*
 
-RUN rosdep init || true && rosdep update || true
+RUN mkdir -p /etc/ros/rosdep/sources.list.d && \
+    if [[ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]]; then \
+      rosdep init; \
+    fi && \
+    rosdep update --rosdistro humble
 
 WORKDIR /workspace
 

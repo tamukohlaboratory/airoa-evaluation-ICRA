@@ -182,8 +182,14 @@ CAMERA_TOPICS_BY_HSR_ID: dict[str, dict[str, str]] = {
         "hand_compressed": "/hand_camera/image_raw/compressed",
         "hand_raw": "/hand_camera/image_raw",
     },
+    "B075": {
+        "head_compressed": "/head_rgbd_sensor/rgb/image_rect_color/compressed",
+        "head_raw": "/head_rgbd_sensor/rgb/image_rect_color",
+        "hand_compressed": "/hand_camera/image_raw/compressed",
+        "hand_raw": "/hand_camera/image_raw",
+    },
 }
-DEFAULT_HSR_ID = "B022"
+DEFAULT_HSR_ID = "B075"
 
 
 def _resolve_camera_topics_for_hsr(hsr_id: Any) -> tuple[str, dict[str, str]]:
@@ -511,6 +517,7 @@ class HSRPolicyClientNode(Node):
         ("instruction", "Grasp the apple."),
         ("config_name", "remote_policy"),
         ("action_mode", ACTION_MODE_AUTO),
+        ("hsr_id", os.environ.get("HSR_ID", DEFAULT_HSR_ID)),
         ("policy_server_host", "127.0.0.1"),
         ("policy_server_port", 8000),
         ("policy_server_api_key", ""),
@@ -666,7 +673,7 @@ class HSREnv:
         self._logged_head_ready = False
         self._logged_hand_ready = False
         self._logged_joint_ready = False
-        self.hsr_id = str(os.environ.get("HSR_ID", DEFAULT_HSR_ID)).strip()
+        self.hsr_id = str(self.node.param("hsr_id") or os.environ.get("HSR_ID", DEFAULT_HSR_ID)).strip()
         self._resolved_hsr_id, camera_topics = _resolve_camera_topics_for_hsr(self.hsr_id)
         self.head_compressed_topic = camera_topics["head_compressed"]
         self.head_raw_topic = camera_topics["head_raw"]
