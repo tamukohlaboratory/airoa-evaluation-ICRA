@@ -90,10 +90,10 @@ server metadata が取れない古い構成を使う場合だけ，必要に応�
 `action_mode:=state_diff_arm_head_relative_gripper_base` を明示してください．
 
 ```
-ros2 launch hsr_policy_client hsr_policy_client.launch.py \
-  test_mode:=false \
-  action_mode:=state_diff_arm_head_relative_gripper_base \
-  instruction:='pick up the coffee bottle on the right' 
+  ros2 launch hsr_policy_client hsr_policy_client.launch.py \
+    test_mode:=false \
+    action_mode:=state_diff_arm_head_relative_gripper_base \
+    instruction:='pick up the coffee bottle on the right' 
 ```
 
 ```

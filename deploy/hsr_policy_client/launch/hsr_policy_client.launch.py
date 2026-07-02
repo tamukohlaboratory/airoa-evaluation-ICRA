@@ -38,6 +38,7 @@ def generate_launch_description() -> LaunchDescription:
      
         DeclareLaunchArgument("smooth_base", default_value="true"),
         DeclareLaunchArgument("gripper_mode", default_value="discrete"),
+        DeclareLaunchArgument("keep_gripper_open", default_value="true"),
         DeclareLaunchArgument("require_control_mode", default_value="false"),
         DeclareLaunchArgument("expected_control_mode", default_value="auto"),
         DeclareLaunchArgument("save_exec_trace", default_value="false"),
@@ -63,6 +64,7 @@ def generate_launch_description() -> LaunchDescription:
         "smooth_gripper": ParameterValue(LaunchConfiguration("smooth_gripper"), value_type=bool),
         "smooth_base": ParameterValue(LaunchConfiguration("smooth_base"), value_type=bool),
         "gripper_mode": LaunchConfiguration("gripper_mode"),
+        "keep_gripper_open": ParameterValue(LaunchConfiguration("keep_gripper_open"), value_type=bool),
         "require_control_mode": ParameterValue(LaunchConfiguration("require_control_mode"), value_type=bool),
         "expected_control_mode": LaunchConfiguration("expected_control_mode"),
         "save_exec_trace": ParameterValue(LaunchConfiguration("save_exec_trace"), value_type=bool),

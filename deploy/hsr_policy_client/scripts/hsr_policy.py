@@ -23,6 +23,7 @@ from sensor_msgs.msg import CompressedImage
 from sensor_msgs.msg import Image
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
+from std_srvs.srv import SetBool
 from trajectory_msgs.msg import JointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
 
@@ -532,6 +533,7 @@ class HSRPolicyClientNode(Node):
         ("smooth_gripper", False),
         ("smooth_base", False),
         ("gripper_mode", "continuous"),
+        ("keep_gripper_open", True),
         ("require_control_mode", False),
         ("expected_control_mode", "auto"),
         ("test_mode", True),
@@ -637,6 +639,9 @@ class SyntheticReplayEnv:
         self._last_action = np.asarray(action, dtype=np.float32).reshape(-1)
         return True
 
+    def stop_motion(self) -> None:
+        return
+
     def sleep(self):
         time.sleep(self.sleep_period_s)
 
@@ -662,6 +667,7 @@ class HSREnv:
         self.gripper_state = 0
         self.control_mode: Optional[str] = None
         self.gripper_mode = str(self.node.param("gripper_mode"))
+        self.keep_gripper_open = _param_to_bool(self.node.param("keep_gripper_open"))
         self.require_control_mode = _param_to_bool(self.node.param("require_control_mode"))
         self.expected_control_mode = str(self.node.param("expected_control_mode"))
         self.instruction = str(self.node.param("instruction"))
@@ -1051,7 +1057,17 @@ class HSREnv:
         twist.linear.y = float(action[9])
         twist.angular.z = float(action[10])
 
-        if self.gripper_mode == "continuous":
+        if self.keep_gripper_open:
+            gripper_traj = JointTrajectory()
+            gripper_traj.joint_names = ["hand_motor_joint"]
+            gripper_point = JointTrajectoryPoint()
+            gripper_point.positions = [1.239183768915874]
+            gripper_point.velocities = []
+            gripper_point.time_from_start = Duration(seconds=1.0).to_msg()
+            gripper_traj.points = [gripper_point]
+            self.gripper_pub.publish(gripper_traj)
+            self.gripper_state = self.GRIPPER_OPEN
+        elif self.gripper_mode == "continuous":
             gripper_traj = JointTrajectory()
             gripper_traj.joint_names = ["hand_motor_joint"]
             gripper_point = JointTrajectoryPoint()
@@ -1097,6 +1113,10 @@ class HSREnv:
         self.head_pub.publish(head_traj)
         self.base_pub.publish(twist)
         return True
+
+    def stop_motion(self) -> None:
+        twist = Twist()
+        self.base_pub.publish(twist)
 
     def sleep(self):
         time.sleep(self.sleep_period_s)
@@ -1573,6 +1593,7 @@ def main(args=None):
     expected_control_mode: str = str(node.param("expected_control_mode"))
     test_mode: bool = _param_to_bool(node.param("test_mode"))
     gripper_mode: str = str(node.param("gripper_mode"))
+    keep_gripper_open: bool = _param_to_bool(node.param("keep_gripper_open"))
 
     save_exec_trace: bool = _param_to_bool(node.param("save_exec_trace"))
     trace_group_name = _build_trace_group_name(
@@ -1609,6 +1630,7 @@ def main(args=None):
     _loginfo(logger, "test_mode: %s", test_mode)
     _loginfo(logger, "execution_freq: %s", execution_freq)
     _loginfo(logger, "gripper_mode: %s", gripper_mode)
+    _loginfo(logger, "keep_gripper_open: %s", keep_gripper_open)
     _loginfo(logger, "save_exec_trace: %s", save_exec_trace)
     _loginfo(logger, "exec_trace_group_name: %s", trace_group_name)
 
@@ -1674,6 +1696,40 @@ def main(args=None):
         base_action_names=env.base_action_names,
     )
 
+    policy_enabled = threading.Event()
+
+    def set_enabled_srv(request: SetBool.Request, response: SetBool.Response):
+        if request.data:
+            policy.action_queue.clear()
+            try:
+                env.reset_observation(reset_joint_state=False)
+            except Exception as e:
+                _logwarn(logger, "Failed to reset observations when enabling inference: %s", e)
+            policy_enabled.set()
+            response.success = True
+            response.message = "hsr_policy_client inference enabled with fresh observations."
+            _loginfo(logger, response.message)
+            return response
+
+        policy_enabled.clear()
+        policy.action_queue.clear()
+        try:
+            env.stop_motion()
+        except Exception as e:
+            _logwarn(logger, "Failed to stop robot motion when disabling inference: %s", e)
+        response.success = True
+        response.message = "hsr_policy_client inference disabled."
+        _loginfo(logger, response.message)
+        return response
+
+    set_enabled_service = node.create_service(
+        SetBool,
+        "/hsr_policy_client/set_enabled",
+        set_enabled_srv,
+    )
+    _ = set_enabled_service
+    _loginfo(logger, "Inference is disabled. Waiting for /hsr_policy_client/set_enabled true.")
+
     log_interval = 1
     if upsample and update_freq > 0:
         log_interval = max(int(round(execution_freq / update_freq)), 1)
@@ -1712,8 +1768,24 @@ def main(args=None):
                     env.sleep()
                     continue
 
+            if not policy_enabled.is_set():
+                if tick % log_interval == 0:
+                    _loginfo(logger, "Inference disabled. Observations are kept warm.")
+                tick += 1
+                env.sleep()
+                continue
+
             action = policy.act(obs)
             action_t_s = time.perf_counter() - perf0
+            if not policy_enabled.is_set():
+                policy.action_queue.clear()
+                try:
+                    env.stop_motion()
+                except Exception as e:
+                    _logwarn(logger, "Failed to stop robot motion after disabled inference: %s", e)
+                tick += 1
+                env.sleep()
+                continue
             action_to_send = action_smoother.update(action)
             is_executed = env.execute_actions(action_to_send)
             sent_t_s = time.perf_counter() - perf0
